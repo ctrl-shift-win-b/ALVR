@@ -137,9 +137,13 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(
         }
     }
 
+    // FFmpeg nvenc presets are p1..p7. Session may still carry 0 from an incomplete solidify.
+    uint32_t nvenc_preset = settings.m_nvencQualityPreset;
+    if (nvenc_preset < 1 || nvenc_preset > 7) {
+        nvenc_preset = 1;
+    }
     char preset[] = "p0";
-    // replace 0 with preset number
-    preset[1] += settings.m_nvencQualityPreset;
+    preset[1] = char('0' + nvenc_preset);
     av_opt_set(encoder_ctx->priv_data, "preset", preset, 0);
 
     if (settings.m_nvencAdaptiveQuantizationMode == 1) {
@@ -152,7 +156,12 @@ alvr::EncodePipelineNvEnc::EncodePipelineNvEnc(
         av_opt_set_int(encoder_ctx->priv_data, "weighted_pred", 1, 0);
     }
 
-    av_opt_set_int(encoder_ctx->priv_data, "tune", settings.m_nvencTuningPreset, 0);
+    // tune must be 1..4 (hq / ll / ull / lossless)
+    int nvenc_tune = (int)settings.m_nvencTuningPreset;
+    if (nvenc_tune < 1 || nvenc_tune > 4) {
+        nvenc_tune = 3; // ultra low latency
+    }
+    av_opt_set_int(encoder_ctx->priv_data, "tune", nvenc_tune, 0);
     av_opt_set_int(encoder_ctx->priv_data, "zerolatency", 1, 0);
     // Delay isn't actually a delay instead its how many surfaces to encode at a time
     av_opt_set_int(encoder_ctx->priv_data, "delay", 1, 0);
