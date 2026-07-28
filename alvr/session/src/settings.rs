@@ -1967,10 +1967,11 @@ pub fn session_settings_default() -> SettingsDefault {
                 content: ControllersConfigDefault {
                     gui_collapsed: false,
                     tracked: true,
+                    // Hand skeleton is a hard OpenVR layout lock. Off by default.
                     hand_skeleton: SwitchDefault {
-                        enabled: true,
+                        enabled: false,
                         content: HandSkeletonConfigDefault {
-                            steamvr_input_2_0: true,
+                            steamvr_input_2_0: false,
                             predict: false,
                         },
                     },
@@ -1984,7 +1985,8 @@ pub fn session_settings_default() -> SettingsDefault {
                                 content: vec![],
                             },
                         },
-                        variant: ControllersEmulationModeDefaultVariant::Quest2Touch,
+                        // Generic SteamVR profile; 20.14.1 has no PSVR2 Sense emulation mode.
+                        variant: ControllersEmulationModeDefaultVariant::ValveIndex,
                     },
                     extra_openvr_props: default_custom_openvr_props,
                     button_mappings: OptionalDefault {

@@ -37,11 +37,8 @@ pub fn steamvr_settings_file_path() -> Result<PathBuf> {
     .to_any()?
     .join("Steam/config/steamvr.vrsettings");
 
-    if path.exists() {
-        Ok(path)
-    } else {
-        bail!("{} does not exist", path.to_string_lossy())
-    }
+    // May not exist until SteamVR has been launched at least once. Callers must handle missing file.
+    Ok(path)
 }
 
 pub fn load_openvr_paths_json() -> Result<json::Value> {

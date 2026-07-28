@@ -71,7 +71,35 @@ fn unblock_alvr_driver() -> Result<()> {
     }
 
     let path = alvr_server_io::steamvr_settings_file_path()?;
-    let text = fs::read_to_string(&path).with_context(|| format!("Failed to read {path:?}"))?;
+
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!(
+                "steamvr.vrsettings not found at {} — creating a minimal file.",
+                path.display()
+            );
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create SteamVR config dir {}", parent.display())
+                })?;
+            }
+            let seed = json!({
+                DRIVER_KEY: {
+                    BLOCKED_KEY: false
+                }
+            });
+            let seed_text = serde_json::to_string_pretty(&seed)?;
+            fs::write(&path, &seed_text).with_context(|| {
+                format!("Failed to create missing steamvr.vrsettings at {}", path.display())
+            })?;
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to read {}", path.display()));
+        }
+    };
+
     let new_text = unblock_alvr_driver_within_vrsettings(text.as_str())
         .with_context(|| "Failed to rewrite .vrsettings.")?;
     fs::write(&path, new_text)

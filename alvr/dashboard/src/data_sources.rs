@@ -72,6 +72,13 @@ pub fn get_read_only_local_session() -> Arc<ServerSessionManager> {
     Arc::new(get_local_session_source())
 }
 
+/// Synchronously write a full session to disk before launching SteamVR.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_local_session(session: alvr_session::SessionConfig) {
+    let mut session_manager = get_local_session_source();
+    *session_manager.session_mut() = session;
+}
+
 fn report_event_local(
     context: &egui::Context,
     sender: &mpsc::Sender<PolledEvent>,

@@ -603,12 +603,12 @@ fn connection_pipeline(
         UVec2::new(align32(res.x), align32(res.y))
     }
 
-    let stream_view_resolution = get_view_res(
+    let mut stream_view_resolution = get_view_res(
         initial_settings.video.transcoding_view_resolution.clone(),
         streaming_caps.default_view_resolution,
     );
 
-    let target_view_resolution = get_view_res(
+    let mut target_view_resolution = get_view_res(
         initial_settings
             .video
             .emulated_headset_view_resolution
@@ -616,7 +616,7 @@ fn connection_pipeline(
         streaming_caps.default_view_resolution,
     );
 
-    let fps = {
+    let mut fps = {
         let mut best_match = 0_f32;
         let mut min_diff = f32::MAX;
         for rate in &streaming_caps.supported_refresh_rates {
@@ -769,6 +769,61 @@ fn connection_pipeline(
 
     let wired = client_ip.is_loopback();
 
+    // Never auto-restart SteamVR on connect when hard config is solidified (App Store AVP /
+    // Virtual Desktop–style stability). Apply locked geometry *before* stream config is sent.
+    let solidified = session_manager_lock.session().hard_config_solidified;
+    let locked = session_manager_lock.session().openvr_config.clone();
+
+    let mut new_openvr_config = contruct_openvr_config(session_manager_lock.session());
+    new_openvr_config.eye_resolution_width = stream_view_resolution.x;
+    new_openvr_config.eye_resolution_height = stream_view_resolution.y;
+    new_openvr_config.target_eye_resolution_width = target_view_resolution.x;
+    new_openvr_config.target_eye_resolution_height = target_view_resolution.y;
+    new_openvr_config.refresh_rate = fps as _;
+    new_openvr_config.enable_foveated_encoding = enable_foveated_encoding;
+    new_openvr_config.h264_profile = encoder_profile as _;
+    new_openvr_config.use_10bit_encoder = enable_10_bits_encoding;
+    new_openvr_config.use_full_range_encoding = use_full_range;
+    new_openvr_config.enable_hdr = enable_hdr;
+    new_openvr_config.encoding_gamma = encoding_gamma;
+    new_openvr_config.codec = codec as _;
+
+    if solidified {
+        if locked != new_openvr_config {
+            warn!(
+                "Hard config is solidified; ignoring connect-time OpenVR config mismatch and \
+                using locked layout ({}x{} @ {}Hz). Re-solidify and relaunch SteamVR from Hard \
+                Config if you intentionally changed layout.",
+                locked.eye_resolution_width, locked.eye_resolution_height, locked.refresh_rate
+            );
+        }
+        stream_view_resolution = UVec2::new(
+            locked.eye_resolution_width,
+            locked.eye_resolution_height,
+        );
+        target_view_resolution = UVec2::new(
+            locked.target_eye_resolution_width,
+            locked.target_eye_resolution_height,
+        );
+        let locked_fps = locked.refresh_rate as f32;
+        if streaming_caps
+            .supported_refresh_rates
+            .iter()
+            .any(|r| (*r - locked_fps).abs() < 0.1)
+        {
+            fps = locked_fps;
+        }
+        // Do not send Restarting; do not rewrite openvr_config.
+    } else if session_manager_lock.session().openvr_config != new_openvr_config {
+        // Legacy path without solidify: bake for next launch but do NOT kill SteamVR mid-connect.
+        warn!(
+            "Hard config was not solidified before SteamVR start. Baking OpenVR config for the \
+            *next* launch and continuing without restart. Use Hard Config → Solidify & Launch."
+        );
+        session_manager_lock.session_mut().openvr_config = new_openvr_config;
+        // Intentionally no Restarting / notify_restart_driver — restart cycles are unacceptable.
+    }
+
     dbg_connection!("connection_pipeline: send streaming config");
     let stream_config_packet = alvr_packets::encode_stream_config(
         session_manager_lock.session(),
@@ -789,28 +844,6 @@ fn connection_pipeline(
 
     let (mut control_sender, mut control_receiver) =
         proto_socket.split(STREAMING_RECV_TIMEOUT).to_con()?;
-
-    let mut new_openvr_config = contruct_openvr_config(session_manager_lock.session());
-    new_openvr_config.eye_resolution_width = stream_view_resolution.x;
-    new_openvr_config.eye_resolution_height = stream_view_resolution.y;
-    new_openvr_config.target_eye_resolution_width = target_view_resolution.x;
-    new_openvr_config.target_eye_resolution_height = target_view_resolution.y;
-    new_openvr_config.refresh_rate = fps as _;
-    new_openvr_config.enable_foveated_encoding = enable_foveated_encoding;
-    new_openvr_config.h264_profile = encoder_profile as _;
-    new_openvr_config.use_10bit_encoder = enable_10_bits_encoding;
-    new_openvr_config.use_full_range_encoding = use_full_range;
-    new_openvr_config.enable_hdr = enable_hdr;
-    new_openvr_config.encoding_gamma = encoding_gamma;
-    new_openvr_config.codec = codec as _;
-
-    if session_manager_lock.session().openvr_config != new_openvr_config {
-        session_manager_lock.session_mut().openvr_config = new_openvr_config;
-
-        control_sender.send(&ServerControlPacket::Restarting).ok();
-
-        crate::notify_restart_driver();
-    }
 
     dbg_connection!("connection_pipeline: Send StartStream packet");
     control_sender

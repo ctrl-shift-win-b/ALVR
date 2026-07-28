@@ -1,13 +1,17 @@
 mod components;
 
 use self::components::{
-    DevicesTab, LogsTab, NotificationBar, SettingsTab, SetupWizard, SetupWizardRequest,
+    DevicesTab, HardConfigAction, HardConfigTab, LogsTab, NotificationBar, SettingsTab,
+    SetupWizard, SetupWizardRequest,
 };
 use crate::{
     dashboard::components::{CloseAction, NewVersionPopup, StatisticsTab},
     DataSources,
 };
-use alvr_common::parking_lot::{Condvar, Mutex};
+use alvr_common::{
+    parking_lot::{Condvar, Mutex},
+    warn,
+};
 use alvr_events::EventType;
 use alvr_gui_common::theme;
 use alvr_packets::{PathValuePair, ServerRequest};
@@ -17,6 +21,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Tab {
+    HardConfig,
     Devices,
     Statistics,
     Settings,
@@ -34,6 +39,7 @@ pub struct Dashboard {
     server_restarting_condvar: Arc<Condvar>,
     selected_tab: Tab,
     tab_labels: BTreeMap<Tab, &'static str>,
+    hard_config_tab: HardConfigTab,
     connections_tab: DevicesTab,
     statistics_tab: StatisticsTab,
     settings_tab: SettingsTab,
@@ -45,6 +51,7 @@ pub struct Dashboard {
     new_version_popup: Option<components::NewVersionPopup>,
     setup_wizard_open: bool,
     session: Option<SessionConfig>,
+    hard_config_synced: bool,
 }
 
 impl Dashboard {
@@ -58,11 +65,12 @@ impl Dashboard {
             just_opened: true,
             server_restarting: Arc::new(Mutex::new(false)),
             server_restarting_condvar: Arc::new(Condvar::new()),
-            selected_tab: Tab::Devices,
+            selected_tab: Tab::HardConfig,
             tab_labels: [
+                (Tab::HardConfig, "🔒  Hard Config"),
                 (Tab::Devices, "🔌  Devices"),
                 (Tab::Statistics, "📈  Statistics"),
-                (Tab::Settings, "⚙  Settings"),
+                (Tab::Settings, "⚙  Runtime Settings"),
                 #[cfg(not(target_arch = "wasm32"))]
                 (Tab::Installation, "💾  Installation"),
                 (Tab::Logs, "📝  Logs"),
@@ -71,6 +79,7 @@ impl Dashboard {
             ]
             .into_iter()
             .collect(),
+            hard_config_tab: HardConfigTab::new(),
             connections_tab: DevicesTab::new(),
             statistics_tab: StatisticsTab::new(),
             settings_tab: SettingsTab::new(),
@@ -82,7 +91,23 @@ impl Dashboard {
             setup_wizard_open: false,
             session: None,
             new_version_popup: None,
+            hard_config_synced: false,
         }
+    }
+
+    fn solidify_and_launch(&self, mut session: SessionConfig, requests: &mut Vec<ServerRequest>) {
+        session.solidify_hard_config();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::steamvr_launcher::LAUNCHER
+                .lock()
+                .ensure_steamvr_shutdown();
+            crate::data_sources::write_local_session(session.clone());
+            crate::steamvr_launcher::LAUNCHER.lock().launch_steamvr();
+        }
+
+        requests.push(ServerRequest::UpdateSession(Box::new(session)));
     }
 
     // This call may block
@@ -139,6 +164,10 @@ impl eframe::App for Dashboard {
                     self.settings_tab.update_session(&session.session_settings);
                     self.logs_tab.update_settings(&settings);
                     self.notification_bar.update_settings(&settings);
+                    if !self.hard_config_synced {
+                        self.hard_config_tab.sync_from_session(&session);
+                        self.hard_config_synced = true;
+                    }
                     if self.just_opened {
                         if settings.extra.open_setup_wizard {
                             self.setup_wizard_open = true;
@@ -149,7 +178,12 @@ impl eframe::App for Dashboard {
 
                     self.session = Some(*session);
                 }
-                EventType::ServerRequestsSelfRestart => self.restart_steamvr(&mut requests),
+                EventType::ServerRequestsSelfRestart => {
+                    warn!(
+                        "Ignored SteamVR self-restart request. Use Hard Config → Solidify & Launch \
+                        if you changed layout settings."
+                    );
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 EventType::DriversList(list) => self.installation_tab.update_drivers(list),
                 EventType::Adb(adb_event) => self
@@ -231,11 +265,24 @@ impl eframe::App for Dashboard {
                             ui.add_space(5.0);
 
                             if connected_to_server {
-                                if ui.button("Restart SteamVR").clicked() {
-                                    self.restart_steamvr(&mut requests);
+                                if ui.button("Stop SteamVR").clicked() {
+                                    requests.push(ServerRequest::ShutdownSteamvr);
+                                    crate::steamvr_launcher::LAUNCHER
+                                        .lock()
+                                        .ensure_steamvr_shutdown();
                                 }
-                            } else if ui.button("Launch SteamVR").clicked() {
-                                crate::steamvr_launcher::LAUNCHER.lock().launch_steamvr();
+                            } else if ui
+                                .button("Solidify & Launch SteamVR")
+                                .on_hover_text(
+                                    "Bakes hard OpenVR layout into session.json, then starts SteamVR",
+                                )
+                                .clicked()
+                            {
+                                if let Some(session) = self.session.clone() {
+                                    self.solidify_and_launch(session, &mut requests);
+                                } else {
+                                    crate::steamvr_launcher::LAUNCHER.lock().launch_steamvr();
+                                }
                             }
 
                             ui.horizontal(|ui| {
@@ -266,6 +313,29 @@ impl eframe::App for Dashboard {
                     ui.with_layout(Layout::top_down_justified(Align::LEFT), |ui| {
                         ui.heading(RichText::new(self.tab_labels[&self.selected_tab]).size(25.0));
                         match self.selected_tab {
+                            Tab::HardConfig => {
+                                for action in self.hard_config_tab.ui(
+                                    ui,
+                                    self.session.as_ref(),
+                                    connected_to_server,
+                                ) {
+                                    match action {
+                                        HardConfigAction::ServerRequest(req) => {
+                                            requests.push(req);
+                                        }
+                                        HardConfigAction::ApplySession(session) => {
+                                            self.hard_config_tab.sync_from_session(&session);
+                                            self.session = Some(*session.clone());
+                                            requests.push(ServerRequest::UpdateSession(session));
+                                        }
+                                        HardConfigAction::SolidifyAndLaunch(session) => {
+                                            self.hard_config_tab.sync_from_session(&session);
+                                            self.session = Some(*session.clone());
+                                            self.solidify_and_launch(*session, &mut requests);
+                                        }
+                                    }
+                                }
+                            }
                             Tab::Devices => {
                                 requests.extend(self.connections_tab.ui(ui, connected_to_server));
                             }
@@ -275,6 +345,20 @@ impl eframe::App for Dashboard {
                                 }
                             }
                             Tab::Settings => {
+                                if connected_to_server {
+                                    ui.colored_label(
+                                        theme::OK_GREEN,
+                                        "Runtime mode: prefer real-time settings. Hard layout \
+                                        changes require Hard Config + SteamVR relaunch.",
+                                    );
+                                } else {
+                                    ui.colored_label(
+                                        theme::log_colors::WARNING_LIGHT,
+                                        "SteamVR is not connected. Use Hard Config first, then \
+                                        Solidify & Launch.",
+                                    );
+                                }
+                                ui.add_space(8.0);
                                 requests.extend(self.settings_tab.ui(ui));
                             }
                             #[cfg(not(target_arch = "wasm32"))]

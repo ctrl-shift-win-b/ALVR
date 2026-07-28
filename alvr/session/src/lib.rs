@@ -1,6 +1,8 @@
 mod settings;
+mod solidify;
 
 pub use settings::*;
+pub use solidify::*;
 pub use settings_schema;
 
 use alvr_common::{
@@ -132,11 +134,15 @@ pub struct SessionConfig {
     // The hashmap key is the hostname
     pub client_connections: HashMap<String, ClientConnectionConfig>,
     pub session_settings: SessionSettings,
+    /// When true, hard OpenVR layout was baked before SteamVR start. Connect path must not
+    /// request a SteamVR restart; use locked openvr_config geometry instead.
+    #[serde(default)]
+    pub hard_config_solidified: bool,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self {
+        let mut session = Self {
             server_version: ALVR_VERSION.clone(),
             openvr_config: OpenvrConfig {
                 // avoid realistic resolutions, as on first start, on Linux, it
@@ -157,7 +163,10 @@ impl Default for SessionConfig {
             },
             client_connections: HashMap::new(),
             session_settings: settings::session_settings_default(),
-        }
+            hard_config_solidified: false,
+        };
+        solidify::solidify_hard_config(&mut session);
+        session
     }
 }
 
