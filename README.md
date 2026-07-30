@@ -81,7 +81,7 @@ That installs (sudo) roughly:
 **Also required outside that script:**
 
 - **Rust** via [rustup](https://rustup.rs/) (the build script installs it if `cargo` is missing). Use a recent stable toolchain (workspace `rust-version` may require **1.92+**).
-- **Steam** + **SteamVR** (beta is what this fork was validated against).
+- **Steam** + **SteamVR** (both beta is what this fork was validated against).
 - **GPU drivers:** NVIDIA proprietary driver with working Vulkan + **NVENC** for the usual path; or AMD/Intel with VA-API / AMF as supported by upstream ALVR.
 - **NVIDIA / NVENC builds:** a working **CUDA toolkit / `nvcc`** is expected when you do *not* pass `--no-nvidia` to `prepare-deps` (the script’s default). AMD-only: use `--no-nvidia`.
 - **Git submodules** (OpenVR headers): the build script runs `git submodule update --init --recursive`.
