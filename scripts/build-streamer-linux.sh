@@ -187,9 +187,11 @@ if [[ "$WITH_LAUNCHER" -eq 1 ]]; then
   echo " Launcher:  $REPO_ROOT/build/alvr_launcher_linux/"
 fi
 echo
-echo " Run:"
+echo " Run (or use one-click helper):"
 echo "   $REPO_ROOT/build/alvr_streamer_linux/bin/alvr_dashboard"
+echo "   $REPO_ROOT/scripts/restart-alvr-steamvr.sh"
 echo
-echo " First use: Hard Config → Apply AVP + PSVR2 defaults → Solidify & Launch SteamVR"
-echo " Docs:      docs/HARD_CONFIG.md"
+echo " First use: Hard Config → Apply AVP defaults → Solidify & Launch SteamVR"
+echo "            (or: ./scripts/restart-alvr-steamvr.sh after solidify)"
+echo " README:    see Mint Linux preamble at top of README.md"
 echo "========================================================================"
