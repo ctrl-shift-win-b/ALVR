@@ -893,6 +893,18 @@ pub struct AudioConfig {
     )]
     #[cfg_attr(not(windows), schema(strings(display_name = "Headset microphone")))]
     pub microphone: Switch<MicrophoneConfig>,
+
+    // Linux-only: automatically point system default sink/source at ALVR PipeWire nodes
+    // while streaming, and restore the previous defaults when the stream ends.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        schema(flag = "hidden")
+    )]
+    #[schema(strings(
+        display_name = "Switch default audio devices while streaming",
+        help = r"When enabled, set the system default output to ALVR Audio and the default input to ALVR Microphone for the duration of the stream, then restore the previous defaults when the stream ends. Disable to keep manual routing."
+    ))]
+    pub linux_auto_switch_default_devices: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1897,6 +1909,8 @@ pub fn session_settings_default() -> SettingsDefault {
                     },
                 },
             },
+            // Default on for Mint one-click routing; UI is hidden on non-Linux.
+            linux_auto_switch_default_devices: true,
         },
         headset: HeadsetConfigDefault {
             emulation_mode: HeadsetEmulationModeDefault {
@@ -2145,7 +2159,8 @@ pub fn session_settings_default() -> SettingsDefault {
                         variant: LogSeverityDefaultVariant::Error,
                     },
                 },
-                log_to_disk: cfg!(debug_assertions),
+                // Always on for this Mint fork so handshake/audio/NVENC issues are diagnosable.
+                log_to_disk: true,
                 log_button_presses: false,
                 log_tracking: false,
                 log_haptics: false,

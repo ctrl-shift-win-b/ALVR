@@ -346,6 +346,27 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
 
         dbg_connection!("handshake_loop: Try connect to manual IPs");
 
+        // Recover from a stuck Connecting state (e.g. half-finished handshake after
+        // client reboot). Without this, both manual and discovery paths never retry.
+        {
+            let mut session_manager = SESSION_MANAGER.write();
+            let stuck: Vec<String> = session_manager
+                .client_list()
+                .iter()
+                .filter(|(_, info)| info.connection_state == ConnectionState::Connecting)
+                .map(|(h, _)| h.clone())
+                .collect();
+            for hostname in stuck {
+                warn!(
+                    "Resetting stuck Connecting state for {hostname} so handshake can retry"
+                );
+                session_manager.update_client_list(
+                    hostname,
+                    ClientListAction::SetConnectionState(ConnectionState::Disconnected),
+                );
+            }
+        }
+
         let available_manual_client_ips = {
             let mut manual_client_ips = HashMap::new();
             for (hostname, connection_info) in
@@ -437,7 +458,9 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
                         Arc::clone(&lifecycle_state),
                         [(client_ip, client_hostname.clone())].into_iter().collect(),
                     ) {
-                        error!("Could not initiate connection for {client_hostname}: {e}");
+                        error!(
+                            "Could not initiate connection for {client_hostname} at {client_ip}: {e}"
+                        );
                     }
                 }
 
@@ -923,6 +946,10 @@ fn connection_pipeline(
         }
     });
 
+    // SteamVR often strips XDG_RUNTIME_DIR; fix env before PipeWire audio threads start.
+    #[cfg(target_os = "linux")]
+    alvr_audio::linux::ensure_pipewire_env();
+
     #[cfg_attr(target_os = "linux", allow(unused_variables))]
     let game_audio_thread = if let Switch::Enabled(config) =
         initial_settings.audio.game_audio.clone()
@@ -1057,6 +1084,11 @@ fn connection_pipeline(
         } else {
             thread::spawn(|| ())
         };
+
+    // NOTE: Do NOT run AudioRouteGuard here. It waits for PipeWire nodes that are
+    // only created by the audio threads once ConnectionState::Streaming is set
+    // (see is_streaming). Blocking here delays Streaming and the AVP client
+    // disconnects after ~1s → Connecting/Enter loop.
 
     *ctx.tracking_manager.write() =
         TrackingManager::new(initial_settings.connection.statistics_history_size);
@@ -1495,6 +1527,25 @@ fn connection_pipeline(
     ctx.events_sender
         .send(ServerCoreEvent::ClientConnected)
         .ok();
+
+    // Switch system defaults only AFTER Streaming is set so audio threads are
+    // allowed to create ALVR Audio / ALVR Microphone PipeWire nodes.
+    #[cfg(target_os = "linux")]
+    let _audio_route_guard = if initial_settings.audio.linux_auto_switch_default_devices {
+        let switch_sink = matches!(initial_settings.audio.game_audio, Switch::Enabled(_));
+        let switch_source = matches!(initial_settings.audio.microphone, Switch::Enabled(_));
+        info!(
+            "Audio route: auto-switch defaults enabled (sink={switch_sink}, source={switch_source})"
+        );
+        // Drop the session lock while waiting on pactl so other threads can run.
+        drop(session_manager_lock);
+        let guard = alvr_audio::linux::AudioRouteGuard::activate(switch_sink, switch_source);
+        session_manager_lock = SESSION_MANAGER.write();
+        guard
+    } else {
+        info!("Audio route: auto-switch defaults disabled by setting");
+        None
+    };
 
     dbg_connection!("connection_pipeline: handshake finished; unlocking streams");
     alvr_common::wait_rwlock(&disconnect_notif, &mut session_manager_lock);

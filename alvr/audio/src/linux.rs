@@ -1,4 +1,9 @@
-use alvr_common::{anyhow::Result, debug, error, parking_lot::Mutex, ConnectionError};
+use alvr_common::{
+    anyhow::{bail, Context, Result},
+    debug, error, info, warn,
+    parking_lot::Mutex,
+    ConnectionError,
+};
 use alvr_session::AudioBufferingConfig;
 use alvr_sockets::{StreamReceiver, StreamSender};
 use pipewire::{
@@ -10,7 +15,20 @@ use pipewire::{
     },
     stream::{StreamFlags, StreamListener, StreamState},
 };
-use std::{cmp, collections::VecDeque, sync::Arc, thread, time::Duration};
+use std::{
+    cmp,
+    collections::VecDeque,
+    fs,
+    io::Write,
+    path::PathBuf,
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 struct Terminate;
 
 pub fn play_microphone_loop_pipewire(
@@ -356,4 +374,619 @@ fn pw_audio_loop(
 
     mainloop.run();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Default sink/source auto-switch for Linux (PipeWire / Pulse compatibility)
+// ---------------------------------------------------------------------------
+
+/// PipeWire node name for the game-audio capture sink (PC → HMD).
+pub const ALVR_AUDIO_SINK_NAME: &str = "ALVR Audio";
+/// PipeWire node name for the HMD microphone virtual source (HMD → PC).
+pub const ALVR_MICROPHONE_SOURCE_NAME: &str = "ALVR Microphone";
+
+const RESTORE_FILE_NAME: &str = "alvr-audio-defaults.restore";
+/// Initial blocking wait for PipeWire nodes after Streaming starts.
+const WAIT_ATTEMPTS: u32 = 60;
+const WAIT_INTERVAL: Duration = Duration::from_millis(100);
+/// Keep re-applying defaults while the stream is alive (reconnect / late nodes /
+/// another app stealing the default).
+const REASSERT_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Ensure the process can talk to the user PipeWire/Pulse session.
+///
+/// SteamVR (and Steam Runtime) often launch `vrserver` **without**
+/// `XDG_RUNTIME_DIR`. PipeWire node creation and `pactl` then miss the host
+/// session, so ALVR sinks never show up and default switching is a no-op.
+/// Call this **before** spawning PipeWire audio threads.
+pub fn ensure_pipewire_env() {
+    let runtime = resolve_xdg_runtime_dir();
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        if let Some(ref dir) = runtime {
+            warn!(
+                "Audio route: XDG_RUNTIME_DIR was unset (common under SteamVR); \
+                 setting to {}",
+                dir.display()
+            );
+            // SAFETY: single-threaded at server init / connection setup; only
+            // sets env when previously missing so children inherit a valid path.
+            std::env::set_var("XDG_RUNTIME_DIR", dir);
+        } else {
+            warn!(
+                "Audio route: XDG_RUNTIME_DIR unset and /run/user/<uid> missing; \
+                 PipeWire/pactl will likely fail"
+            );
+        }
+    }
+
+    // Help Pulse clients (pactl) find the session socket when Steam strips env.
+    if std::env::var_os("PULSE_SERVER").is_none() {
+        if let Some(ref dir) = runtime {
+            let pulse = dir.join("pulse/native");
+            if pulse.exists() {
+                std::env::set_var(
+                    "PULSE_SERVER",
+                    format!("unix:{}", pulse.display()),
+                );
+            }
+        }
+    }
+}
+
+fn resolve_xdg_runtime_dir() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let path = PathBuf::from(p);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    let uid = current_uid()?;
+    let path = PathBuf::from(format!("/run/user/{uid}"));
+    if path.is_dir() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn current_uid() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// Saves the current system default sink/source, points them at ALVR's PipeWire
+/// nodes for the stream duration, and restores the originals on drop.
+///
+/// Also writes a small restore file under `$XDG_RUNTIME_DIR` so a subsequent
+/// ALVR start can heal defaults after a hard kill.
+///
+/// A background re-assert thread keeps defaults on the ALVR nodes for the whole
+/// stream: late PipeWire registration after reconnect, or another process
+/// stealing the default, will be corrected without needing a full rehandshake.
+pub struct AudioRouteGuard {
+    previous_sink: Option<String>,
+    previous_source: Option<String>,
+    restored: bool,
+    stop_reassert: Arc<AtomicBool>,
+    reassert_thread: Option<JoinHandle<()>>,
+}
+
+impl AudioRouteGuard {
+    /// Switch system defaults to ALVR nodes for the sides that are enabled.
+    ///
+    /// Returns `None` when neither side should be switched. Always best-effort:
+    /// missing `pactl` or nodes only produce warnings, never hard errors.
+    pub fn activate(switch_sink: bool, switch_source: bool) -> Option<Self> {
+        if !switch_sink && !switch_source {
+            return None;
+        }
+
+        ensure_pipewire_env();
+
+        // Read any previous restore snapshot *before* stale restore deletes it.
+        // Needed when the current default is still an ALVR node (reconnect race,
+        // manual set, or unclean previous exit) so we don't save ALVR as the
+        // restore target and lose the user's real 5.1 / desk devices.
+        let (saved_sink, saved_source) = read_restore_file();
+
+        // Heal any leftover defaults from a previous unclean exit first.
+        restore_stale_defaults();
+
+        if !pactl_available() {
+            warn!(
+                "pactl not found or cannot reach the Pulse/PipeWire session; \
+                 cannot auto-switch default audio devices. \
+                 Route games to \"{ALVR_AUDIO_SINK_NAME}\" and apps to \
+                 \"{ALVR_MICROPHONE_SOURCE_NAME}\" manually."
+            );
+            return None;
+        }
+
+        let previous_sink = if switch_sink {
+            capture_previous_device(
+                "sink",
+                get_default_sink().ok(),
+                saved_sink,
+                ALVR_AUDIO_SINK_NAME,
+            )
+        } else {
+            None
+        };
+
+        let previous_source = if switch_source {
+            capture_previous_device(
+                "source",
+                get_default_source().ok(),
+                saved_source,
+                ALVR_MICROPHONE_SOURCE_NAME,
+            )
+        } else {
+            None
+        };
+
+        write_restore_file(previous_sink.as_deref(), previous_source.as_deref());
+
+        // Short initial wait so the common path switches defaults before the
+        // connection pipeline blocks on disconnect_notif. Re-assert covers late
+        // nodes after AVP Home → reconnect.
+        if switch_sink {
+            let _ = wait_for_device("sinks", ALVR_AUDIO_SINK_NAME);
+        }
+        if switch_source {
+            let _ = wait_for_device("sources", ALVR_MICROPHONE_SOURCE_NAME);
+        }
+        apply_alvr_defaults(switch_sink, switch_source, /*log_missing*/ true);
+
+        // Keep trying for the whole stream so reconnect / late nodes / stolen
+        // defaults are corrected without a full server restart.
+        let stop_reassert = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop_reassert);
+        let reassert_thread = Some(thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                thread::sleep(REASSERT_INTERVAL);
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                apply_alvr_defaults(switch_sink, switch_source, /*log_missing*/ false);
+            }
+        }));
+
+        Some(Self {
+            previous_sink,
+            previous_source,
+            restored: false,
+            stop_reassert,
+            reassert_thread,
+        })
+    }
+
+    /// Explicit restore (also called from Drop).
+    pub fn restore(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.restored = true;
+
+        self.stop_reassert.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.reassert_thread.take() {
+            // Don't block forever on a stuck pactl; reassert sleeps ≤ REASSERT_INTERVAL.
+            let _ = handle.join();
+        }
+
+        ensure_pipewire_env();
+
+        if let Some(ref sink) = self.previous_sink {
+            // Avoid re-pointing at a dead ALVR node if something else already changed defaults.
+            if !names_match(sink, ALVR_AUDIO_SINK_NAME) {
+                match set_default_sink(sink) {
+                    Ok(()) => info!("Audio route: restored default sink → \"{sink}\""),
+                    Err(e) => warn!("Audio route: restore default sink \"{sink}\" failed: {e:#}"),
+                }
+            }
+        }
+
+        if let Some(ref source) = self.previous_source {
+            if !names_match(source, ALVR_MICROPHONE_SOURCE_NAME) {
+                match set_default_source(source) {
+                    Ok(()) => info!("Audio route: restored default source → \"{source}\""),
+                    Err(e) => {
+                        warn!("Audio route: restore default source \"{source}\" failed: {e:#}")
+                    }
+                }
+            }
+        }
+
+        clear_restore_file();
+    }
+}
+
+impl Drop for AudioRouteGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// Choose a non-ALVR device name to restore later.
+///
+/// Prefer the live system default when it is a real desk device. If the live
+/// default is already an ALVR node (reconnect / manual set), fall back to a
+/// previously saved restore-file value.
+fn capture_previous_device(
+    kind: &str,
+    current: Option<String>,
+    saved: Option<String>,
+    alvr_name: &str,
+) -> Option<String> {
+    match current {
+        Some(name) if !names_match(&name, alvr_name) => {
+            info!("Audio route: saving default {kind} \"{name}\"");
+            Some(name)
+        }
+        Some(name) => {
+            if let Some(saved) = saved.filter(|s| !names_match(s, alvr_name)) {
+                info!(
+                    "Audio route: current default {kind} is ALVR (\"{name}\"); \
+                     keeping previously saved \"{saved}\" for restore"
+                );
+                Some(saved)
+            } else {
+                warn!(
+                    "Audio route: current default {kind} is ALVR (\"{name}\") and no \
+                     non-ALVR previous is known; will not restore this side on disconnect"
+                );
+                None
+            }
+        }
+        None => {
+            if let Some(saved) = saved.filter(|s| !names_match(s, alvr_name)) {
+                info!(
+                    "Audio route: could not read default {kind}; \
+                     using previously saved \"{saved}\" for restore"
+                );
+                Some(saved)
+            } else {
+                warn!("Audio route: failed to read default {kind}");
+                None
+            }
+        }
+    }
+}
+
+/// Point system defaults at ALVR nodes when present. Idempotent.
+///
+/// When `log_missing` is true, warn once if nodes are not found yet (initial
+/// activate). The re-assert loop passes false to avoid log spam.
+fn apply_alvr_defaults(switch_sink: bool, switch_source: bool, log_missing: bool) {
+    if switch_sink {
+        match find_named_device("sinks", ALVR_AUDIO_SINK_NAME) {
+            Some(resolved) => {
+                let already = get_default_sink()
+                    .ok()
+                    .is_some_and(|c| names_match(&c, &resolved) || names_match(&c, ALVR_AUDIO_SINK_NAME));
+                if !already {
+                    match set_default_sink(&resolved) {
+                        Ok(()) => {
+                            info!("Audio route: default sink → \"{resolved}\"");
+                            move_all_sink_inputs_to(&resolved);
+                        }
+                        Err(e) => warn!(
+                            "Audio route: set default sink to \"{resolved}\" failed: {e:#}"
+                        ),
+                    }
+                }
+            }
+            None if log_missing => {
+                let known = list_short_names("sinks").join(", ");
+                warn!(
+                    "Audio route: sink matching \"{ALVR_AUDIO_SINK_NAME}\" not found yet \
+                     (known sinks: [{known}]); will keep retrying while stream is active"
+                );
+            }
+            None => {}
+        }
+    }
+
+    if switch_source {
+        match find_named_device("sources", ALVR_MICROPHONE_SOURCE_NAME) {
+            Some(resolved) => {
+                let already = get_default_source().ok().is_some_and(|c| {
+                    names_match(&c, &resolved) || names_match(&c, ALVR_MICROPHONE_SOURCE_NAME)
+                });
+                if !already {
+                    match set_default_source(&resolved) {
+                        Ok(()) => info!("Audio route: default source → \"{resolved}\""),
+                        Err(e) => warn!(
+                            "Audio route: set default source to \"{resolved}\" failed: {e:#}"
+                        ),
+                    }
+                }
+            }
+            None if log_missing => {
+                let known = list_short_names("sources").join(", ");
+                warn!(
+                    "Audio route: source matching \"{ALVR_MICROPHONE_SOURCE_NAME}\" not found yet \
+                     (known sources: [{known}]); will keep retrying while stream is active"
+                );
+            }
+            None => {}
+        }
+    }
+}
+
+/// If a previous ALVR process died without restoring defaults, apply the
+/// restore file (if present) and clear it. Safe to call at server start.
+pub fn restore_stale_defaults() {
+    ensure_pipewire_env();
+
+    let (previous_sink, previous_source) = read_restore_file();
+    let Some(path) = restore_file_path() else {
+        return;
+    };
+
+    if previous_sink.is_none() && previous_source.is_none() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+
+    if !pactl_available() {
+        warn!("Audio route: stale restore file present but pactl missing; leaving as-is");
+        return;
+    }
+
+    info!("Audio route: restoring defaults from previous unclean session");
+
+    if let Some(sink) = previous_sink {
+        // Only restore if the current default is still ALVR (or missing) —
+        // if the user already fixed routing, leave it alone.
+        let current = get_default_sink().ok();
+        let should_restore = match current.as_deref() {
+            None => true,
+            Some(c) if names_match(c, ALVR_AUDIO_SINK_NAME) || !device_exists("sinks", c) => true,
+            Some(_) => false,
+        };
+        if should_restore && !names_match(&sink, ALVR_AUDIO_SINK_NAME) {
+            match set_default_sink(&sink) {
+                Ok(()) => info!("Audio route: stale restore sink → \"{sink}\""),
+                Err(e) => warn!("Audio route: stale restore sink failed: {e:#}"),
+            }
+        }
+    }
+
+    if let Some(source) = previous_source {
+        let current = get_default_source().ok();
+        let should_restore = match current.as_deref() {
+            None => true,
+            Some(c)
+                if names_match(c, ALVR_MICROPHONE_SOURCE_NAME) || !device_exists("sources", c) =>
+            {
+                true
+            }
+            Some(_) => false,
+        };
+        if should_restore && !names_match(&source, ALVR_MICROPHONE_SOURCE_NAME) {
+            match set_default_source(&source) {
+                Ok(()) => info!("Audio route: stale restore source → \"{source}\""),
+                Err(e) => warn!("Audio route: stale restore source failed: {e:#}"),
+            }
+        }
+    }
+
+    let _ = fs::remove_file(&path);
+}
+
+fn names_match(a: &str, b: &str) -> bool {
+    a == b || a.eq_ignore_ascii_case(b)
+}
+
+/// Match exact name, or a Pulse/PipeWire variant that still contains the label.
+fn find_named_device(kind: &str, want: &str) -> Option<String> {
+    let names = list_short_names(kind);
+    if let Some(exact) = names.iter().find(|n| names_match(n, want)) {
+        return Some(exact.clone());
+    }
+    // e.g. "ALVR_Audio" or application-suffixed names containing "ALVR Audio"
+    let want_compact: String = want.chars().filter(|c| !c.is_whitespace()).collect();
+    names.into_iter().find(|n| {
+        let compact: String = n.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.eq_ignore_ascii_case(&want_compact)
+            || n.to_ascii_lowercase()
+                .contains(&want.to_ascii_lowercase())
+    })
+}
+
+fn device_exists(kind: &str, name: &str) -> bool {
+    find_named_device(kind, name).is_some()
+}
+
+fn pactl_available() -> bool {
+    // Require a real session round-trip, not just that the binary exists
+    // (`pactl --version` succeeds even with a broken XDG_RUNTIME_DIR).
+    match pactl_output(&["info"]) {
+        Ok(info) => {
+            let ok = info.contains("Server Name:") || info.contains("Default Sink:");
+            if !ok {
+                warn!("Audio route: pactl info returned unexpected output");
+            }
+            ok
+        }
+        Err(e) => {
+            warn!("Audio route: cannot talk to Pulse/PipeWire via pactl: {e:#}");
+            false
+        }
+    }
+}
+
+fn pactl_command() -> Command {
+    let mut cmd = Command::new("pactl");
+    if let Some(dir) = resolve_xdg_runtime_dir() {
+        cmd.env("XDG_RUNTIME_DIR", &dir);
+        let pulse = dir.join("pulse/native");
+        if pulse.exists() {
+            cmd.env("PULSE_SERVER", format!("unix:{}", pulse.display()));
+        }
+    }
+    cmd
+}
+
+fn pactl_output(args: &[&str]) -> Result<String> {
+    let output = pactl_command()
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run pactl {}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "pactl {} failed ({}): {}",
+            args.join(" "),
+            output.status,
+            stderr.trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn get_default_sink() -> Result<String> {
+    let name = pactl_output(&["get-default-sink"])?;
+    if name.is_empty() {
+        bail!("empty default sink");
+    }
+    Ok(name)
+}
+
+fn get_default_source() -> Result<String> {
+    let name = pactl_output(&["get-default-source"])?;
+    if name.is_empty() {
+        bail!("empty default source");
+    }
+    Ok(name)
+}
+
+fn set_default_sink(name: &str) -> Result<()> {
+    pactl_output(&["set-default-sink", name]).map(|_| ())
+}
+
+fn set_default_source(name: &str) -> Result<()> {
+    pactl_output(&["set-default-source", name]).map(|_| ())
+}
+
+fn list_short_names(kind: &str) -> Vec<String> {
+    // `pactl list short sinks|sources` is TAB-separated:
+    //   index \t name \t driver \t sample-spec \t state
+    // Name may contain spaces ("ALVR Audio"). Splitting on all whitespace
+    // wrongly yields "ALVR" and breaks default switching / reconnect.
+    match pactl_output(&["list", "short", kind]) {
+        Ok(out) => out
+            .lines()
+            .filter_map(|line| {
+                let mut cols = line.split('\t');
+                let _index = cols.next()?;
+                let name = cols.next()?.trim();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_owned())
+                }
+            })
+            .collect(),
+        Err(e) => {
+            warn!("Audio route: list short {kind} failed: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+fn wait_for_device(kind: &str, want: &str) -> Option<String> {
+    for _ in 0..WAIT_ATTEMPTS {
+        if let Some(name) = find_named_device(kind, want) {
+            return Some(name);
+        }
+        thread::sleep(WAIT_INTERVAL);
+    }
+    None
+}
+
+fn move_all_sink_inputs_to(sink_name: &str) {
+    let Ok(out) = pactl_output(&["list", "short", "sink-inputs"]) else {
+        return;
+    };
+    for line in out.lines() {
+        // Short sink-input lines are also tab-separated; index is column 0.
+        let id = line
+            .split('\t')
+            .next()
+            .unwrap_or_else(|| line.split_whitespace().next().unwrap_or(""))
+            .trim();
+        if id.is_empty() {
+            continue;
+        }
+        match pactl_output(&["move-sink-input", id, sink_name]) {
+            Ok(_) => debug!("Audio route: moved sink-input {id} → \"{sink_name}\""),
+            Err(e) => debug!("Audio route: move-sink-input {id} failed: {e:#}"),
+        }
+    }
+}
+
+fn restore_file_path() -> Option<PathBuf> {
+    resolve_xdg_runtime_dir().map(|d| d.join(RESTORE_FILE_NAME))
+}
+
+fn read_restore_file() -> (Option<String>, Option<String>) {
+    let Some(path) = restore_file_path() else {
+        return (None, None);
+    };
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return (None, None);
+    };
+
+    let mut previous_sink: Option<String> = None;
+    let mut previous_source: Option<String> = None;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("sink=") {
+            let s = rest.trim();
+            if !s.is_empty() {
+                previous_sink = Some(s.to_owned());
+            }
+        } else if let Some(rest) = line.strip_prefix("source=") {
+            let s = rest.trim();
+            if !s.is_empty() {
+                previous_source = Some(s.to_owned());
+            }
+        }
+    }
+    (previous_sink, previous_source)
+}
+
+fn write_restore_file(sink: Option<&str>, source: Option<&str>) {
+    let Some(path) = restore_file_path() else {
+        return;
+    };
+    // Never persist ALVR node names as restore targets (dead after stream ends).
+    let sink = sink.filter(|s| !names_match(s, ALVR_AUDIO_SINK_NAME));
+    let source = source.filter(|s| !names_match(s, ALVR_MICROPHONE_SOURCE_NAME));
+    if sink.is_none() && source.is_none() {
+        clear_restore_file();
+        return;
+    }
+    let mut body = String::new();
+    if let Some(s) = sink {
+        body.push_str(&format!("sink={s}\n"));
+    }
+    if let Some(s) = source {
+        body.push_str(&format!("source={s}\n"));
+    }
+    match fs::File::create(&path).and_then(|mut f| f.write_all(body.as_bytes())) {
+        Ok(()) => info!("Audio route: wrote restore file {}", path.display()),
+        Err(e) => warn!("Audio route: failed to write restore file: {e}"),
+    }
+}
+
+fn clear_restore_file() {
+    if let Some(path) = restore_file_path() {
+        let _ = fs::remove_file(path);
+    }
 }

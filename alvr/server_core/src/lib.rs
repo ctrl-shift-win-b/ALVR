@@ -194,6 +194,13 @@ impl ServerCoreContext {
 
         SESSION_MANAGER.write().clean_client_list();
 
+        // Linux: fix SteamVR-stripped audio env, then heal defaults after unclean kill.
+        #[cfg(target_os = "linux")]
+        {
+            alvr_audio::linux::ensure_pipewire_env();
+            alvr_audio::linux::restore_stale_defaults();
+        }
+
         let (events_sender, events_receiver) = mpsc::channel();
 
         // Create a temporary StatisticsManager until a headset connects

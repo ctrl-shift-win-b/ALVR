@@ -23,7 +23,7 @@ That capture stack is **required for streaming**, not optional:
 | **`VK_LAYER_ALVR_capture`** | Headless swapchain intercept: image FDs + pose to the encoder. |
 | **Linux `CEncoder`** | Encodes frames and stamps tracking timestamps for client late-stage warp (LSW). |
 
-**One-click start** (local helper "./scripts/restart-alvr-steamvr.sh") wraps: stop old processes → solidify hard OpenVR config → register driver → wrap compositor → start dashboard with an **absolute** path → launch SteamVR. Without the wrap step, the layer is not loaded and there is nothing to encode.
+**One-click start** (local helper "./scripts/restart-alvr-steamvr.sh") wraps: stop old processes → solidify hard OpenVR config → register driver → wrap compositor → start dashboard with an **absolute** path → launch SteamVR.
 
 ## Network / config architecture (stable one-click)
 
@@ -47,8 +47,18 @@ With current **NVIDIA** drivers on Mint, **per-eye encode size above about 3500�
 
 ### Audio
 
-**Sound routing is not automatic and is largely untested** on this Mint setup. Expect manual Pulse/PipeWire device selection and SteamVR/ALVR audio settings. Silence after a good video stream is a known open area, not proof that video is misconfigured.
+**Automatic audio routing is now testable** for both directions on Linux (Mint/PipeWire): **audio-out** (PC → HMD) and **microphone-in** (HMD → PC). Both were verified live on this setup (game sound + stereo test tones in the headset; speech captured from `ALVR Microphone`).
 
+Linux uses **baked-in PipeWire virtual devices** (no Virtual Audio Cable install):
+
+| Role | Device name | When |
+|------|-------------|------|
+| PC → HMD (game/desktop audio) | **ALVR Audio** (sink) | While streaming with *Headset speaker* enabled |
+| HMD → PC (headset mic) | **ALVR Microphone** (source) | While streaming with *Headset microphone* enabled |
+
+**Auto-switch (default on):** session setting *Switch default audio devices while streaming* (`audio.linux_auto_switch_default_devices`) points the system default sink/source at those nodes when a stream starts, moves existing sink-inputs when possible, and **restores the previous defaults** when the stream ends or ALVR shuts down cleanly. Defaults are **re-applied after client reconnect** (e.g. AVP Home → relaunch), and a background re-assert keeps them on the ALVR nodes while streaming. A stale restore file under `$XDG_RUNTIME_DIR` is applied on next server start after a hard kill.
+
+Uncheck the option to keep manual routing. Stream is **stereo** to the HMD (not a separate spatial codec). Requires `pactl` (`pulseaudio-utils`).
 ### Occasional non-game stutters
 
 Capture and encode share the GPU with SteamVR’s compositor. Process scheduling helpers may raise CPU nice of `vrcompositor` / `vrserver` after launch; that is best-effort (deeper realtime priority usually needs extra capabilities). Stutters can still come from GPU contention, power management, or encode load—not only game CPU.
@@ -120,6 +130,11 @@ cargo xtask build-streamer --platform linux --release
 ```
 
 ### 3. One-click start
+
+Replace your SteaVR Launch command with this (replace USER_NAME with your home directory and make sure the paths are correct!)):
+__GLX_VENDOR_LIBRARY_NAME=nvidia __NV_PRIME_RENDER_OFFLOAD=1 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json LD_LIBRARY_PATH=/lib/x86_64-linux-gnu:/home/[USER_NAME]/ALVR/build/alvr_streamer_linux/lib64/alvr/bin/linux64:$LD_LIBRARY_PATH /home/[USER_NAME]/.steam/debian-installation/steamapps/common/SteamVR/bin/vrmonitor.sh %command%
+
+Then,
 
 ```bash
 ./scripts/restart-alvr-steamvr.sh
