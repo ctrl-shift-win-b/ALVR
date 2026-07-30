@@ -245,17 +245,26 @@ int swapchain::send_fds() {
 }
 
 bool swapchain::try_connect() {
-    Debug("swapchain::try_connect\n");
-    m_socketPath = getenv("XDG_RUNTIME_DIR");
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (!runtime_dir || runtime_dir[0] == '\0') {
+        Error("swapchain::try_connect: XDG_RUNTIME_DIR is unset\n");
+        return false;
+    }
+    m_socketPath = runtime_dir;
     m_socketPath += "/alvr-ipc";
 
-    int ret;
+    // Always create a fresh socket. After a failed connect() the fd is unusable for
+    // another connect() (EINVAL/EISCONN on many kernels). Reusing it spammed
+    // Connection refused forever even after CEncoder started listening.
+    if (m_socket != -1) {
+        close(m_socket);
+        m_socket = -1;
+    }
+
+    m_socket = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (m_socket == -1) {
-        m_socket = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-        if (m_socket == -1) {
-            perror("socket");
-            exit(1);
-        }
+        Error("swapchain::try_connect: socket() failed: %s\n", strerror(errno));
+        return false;
     }
 
     struct sockaddr_un name;
@@ -263,10 +272,23 @@ bool swapchain::try_connect() {
     name.sun_family = AF_UNIX;
     strncpy(name.sun_path, m_socketPath.c_str(), sizeof(name.sun_path) - 1);
 
-    ret = connect(m_socket, (const struct sockaddr *)&name, sizeof(name));
+    int ret = connect(m_socket, (const struct sockaddr *)&name, sizeof(name));
     if (ret == -1) {
-        return false; // we will try again next frame
+        // Rate-limit: log first few fails and then periodically.
+        static int fail_count = 0;
+        fail_count++;
+        if (fail_count <= 3 || (fail_count % 300) == 0) {
+            Debug("swapchain::try_connect: connect(%s) failed (%d): %s\n",
+                  m_socketPath.c_str(),
+                  fail_count,
+                  strerror(errno));
+        }
+        // Close so the next present recreates a clean fd.
+        close(m_socket);
+        m_socket = -1;
+        return false; // try again next frame (once encoder listens)
     }
+    Info("swapchain::try_connect: connected to %s\n", m_socketPath.c_str());
 
     VkPhysicalDeviceVulkan11Properties props11 = {};
     props11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES;
@@ -285,16 +307,20 @@ bool swapchain::try_connect() {
     memcpy(init.device_uuid.data(), props11.deviceUUID, VK_UUID_SIZE);
     ret = write(m_socket, &init, sizeof(init));
     if (ret == -1) {
-        perror("write");
-        exit(1);
+        Error("swapchain::try_connect: write(init) failed: %s\n", strerror(errno));
+        close(m_socket);
+        m_socket = -1;
+        return false;
     }
 
     ret = send_fds();
     if (ret == -1) {
-        perror("sendmsg");
-        exit(1);
+        Error("swapchain::try_connect: send_fds failed: %s\n", strerror(errno));
+        close(m_socket);
+        m_socket = -1;
+        return false;
     }
-    Debug("swapchain sent fds\n");
+    Info("swapchain::try_connect: handshake complete (fds sent)\n");
 
     return true;
 }
@@ -302,7 +328,17 @@ bool swapchain::try_connect() {
 void swapchain::submit_image(uint32_t pending_index) {
     const auto & pose = m_swapchain_images[pending_index].pose.mDeviceToAbsoluteTracking.m;
     if (!m_connected) {
-        m_connected = try_connect();
+        // Rate-limit connect attempts while idle (no CEncoder listener yet).
+        // Trying every frame (90Hz) was wasting syscalls and flooding logs; on
+        // SteamVR beta that can starve compositor IPC and surface as 303.
+        static uint64_t last_attempt_frame = 0;
+        constexpr uint64_t kConnectEveryNFrames = 45; // ~0.5s at 90Hz
+        const uint64_t frame = m_display.m_vsync_count.load();
+        if (last_attempt_frame == 0
+            || (frame - last_attempt_frame) >= kConnectEveryNFrames) {
+            last_attempt_frame = frame == 0 ? 1 : frame;
+            m_connected = try_connect();
+        }
     }
     if (m_connected) {
         int ret;
@@ -313,7 +349,12 @@ void swapchain::submit_image(uint32_t pending_index) {
         memcpy(&packet.pose, pose, sizeof(packet.pose));
         ret = write(m_socket, &packet, sizeof(packet));
         if (ret == -1) {
-            //FIXME: try to reconnect?
+            // Encoder likely restarted; reconnect on next present.
+            Error("swapchain::submit_image: write(present) failed: %s — will reconnect\n",
+                  strerror(errno));
+            close(m_socket);
+            m_socket = -1;
+            m_connected = false;
         }
     }
 }

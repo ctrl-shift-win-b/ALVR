@@ -68,12 +68,11 @@ void TrackedDevice::set_prop(FfiOpenvrProperty prop) {
         );
     }
 
-    auto event_data = vr::VREvent_Data_t {};
-    event_data.property.container = this->prop_container;
-    event_data.property.prop = key;
-    vr::VRServerDriverHost()->VendorSpecificEvent(
-        this->object_id, vr::VREvent_PropertyChanged, event_data, 0.
-    );
+    // Do NOT call VendorSpecificEvent for VREvent_PropertyChanged (111).
+    // VendorSpecificEvent is reserved for VREvent_VendorSpecific_Reserved_Start..End
+    // (10000-19999). SteamVR beta rejects out-of-range events with:
+    //   "VendorSpecificEvent 111 outside of reserved range"
+    // IVRProperties Set*Property already notifies the runtime of property changes.
 }
 
 void TrackedDevice::submit_pose(vr::DriverPose_t pose) {

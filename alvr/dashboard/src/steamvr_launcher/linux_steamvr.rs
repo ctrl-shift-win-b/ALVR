@@ -40,17 +40,41 @@ pub fn maybe_wrap_vrcompositor_launcher() -> alvr_common::anyhow::Result<()> {
     };
 
     let launcher_path = steamvr_bin_dir.join("vrcompositor");
+    let real_path = steamvr_bin_dir.join("vrcompositor.real");
     // In case of SteamVR update, vrcompositor will be restored
     if fs::read_link(&launcher_path).is_ok() {
         fs::remove_file(&launcher_path)?; // recreate the link
-    } else {
-        fs::rename(&launcher_path, steamvr_bin_dir.join("vrcompositor.real"))?;
+    } else if launcher_path.is_file() {
+        fs::rename(&launcher_path, &real_path)?;
     }
 
-    std::os::unix::fs::symlink(
-        crate::get_filesystem_layout().vrcompositor_wrapper(),
-        &launcher_path,
-    )?;
+    // Also install a copy/hardlink whose *basename* is exactly "vrcompositor".
+    // The wrapper execs that path so /proc/self/comm stays "vrcompositor"
+    // (exec of "vrcompositor.real" truncates to "vrcompositor.re" and SteamVR
+    // StartVRCompositor times out with 303 / "process is not running").
+    let layout = crate::get_filesystem_layout();
+    let named_dir = layout.vrcompositor_wrapper_dir.join("steamvr_vrcompositor");
+    let named_bin = named_dir.join("vrcompositor");
+    fs::create_dir_all(&named_dir)?;
+    if real_path.is_file() {
+        let _ = fs::remove_file(&named_bin);
+        if fs::hard_link(&real_path, &named_bin).is_err() {
+            fs::copy(&real_path, &named_bin)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&named_bin)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&named_bin, perms)?;
+            }
+        }
+        debug!(
+            "Installed SteamVR compositor as {} for correct process comm",
+            named_bin.display()
+        );
+    }
+
+    std::os::unix::fs::symlink(layout.vrcompositor_wrapper(), &launcher_path)?;
 
     Ok(())
 }

@@ -170,13 +170,13 @@ void OvrDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t (&perEye)[2])
         if (pose) {
             // found the frameIndex
             m_prevTargetTimestampNs = m_targetTimestampNs;
-            m_targetTimestampNs = pose->targetTimestampNs;
+            m_targetTimestampNs = pose->frame.targetTimestampNs;
 
             m_prevFramePoseRotation = m_framePoseRotation;
-            m_framePoseRotation.x = pose->motion.orientation.x;
-            m_framePoseRotation.y = pose->motion.orientation.y;
-            m_framePoseRotation.z = pose->motion.orientation.z;
-            m_framePoseRotation.w = pose->motion.orientation.w;
+            m_framePoseRotation.x = pose->frame.motion.orientation.x;
+            m_framePoseRotation.y = pose->frame.motion.orientation.y;
+            m_framePoseRotation.z = pose->frame.motion.orientation.z;
+            m_framePoseRotation.w = pose->frame.motion.orientation.w;
         } else {
             m_targetTimestampNs = 0;
             m_framePoseRotation = HmdQuaternion_Init(0.0, 0.0, 0.0, 0.0);

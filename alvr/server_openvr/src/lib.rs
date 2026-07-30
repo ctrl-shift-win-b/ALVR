@@ -423,17 +423,24 @@ pub unsafe extern "C" fn HmdDriverFactory(
         return ptr::null_mut();
     };
 
+    let expected_dashboard = filesystem_layout.dashboard_exe();
+    let expected_dashboard_canon = std::fs::canonicalize(&expected_dashboard)
+        .unwrap_or_else(|_| expected_dashboard.clone());
+
     let dashboard_process_paths = sysinfo::System::new_all()
         .processes_by_name(OsStr::new(&afs::dashboard_fname()))
         .filter_map(|proc| Some(proc.exe()?.to_owned()))
         .collect::<Vec<_>>();
 
-    // Check that there is no active dashboard instance not part of this driver installation
+    // Check that there is no active dashboard instance not part of this driver installation.
+    // Canonicalize both sides: dashboards started as `./build/.../alvr_dashboard` report a
+    // relative exe path and must still match this installation (else SteamVR gets
+    // VRInitError_Init_InterfaceNotFound / 105 and never loads the HMD).
     // Note: if the iterator is empty, `all()` returns true
-    if !dashboard_process_paths
-        .iter()
-        .all(|path| *path == filesystem_layout.dashboard_exe())
-    {
+    if !dashboard_process_paths.iter().all(|path| {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        canon == expected_dashboard_canon || path == &expected_dashboard
+    }) {
         return ptr::null_mut();
     }
 

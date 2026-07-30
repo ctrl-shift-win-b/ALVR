@@ -102,9 +102,40 @@ fn unblock_alvr_driver() -> Result<()> {
 
     let new_text = unblock_alvr_driver_within_vrsettings(text.as_str())
         .with_context(|| "Failed to rewrite .vrsettings.")?;
+    // Also clamp runaway supersample (GPU speed test can leave 2.5–3.0x which
+    // overloads the compositor on high-res ALVR HMDs and contributes to 303 timeouts).
+    let new_text = clamp_steamvr_supersample(new_text.as_str()).unwrap_or(new_text);
     fs::write(&path, new_text)
         .with_context(|| "Failed to write .vrsettings back after changing it.")?;
     Ok(())
+}
+
+/// Cap steamvr.supersampleScale to a sane max for remote HMDs.
+fn clamp_steamvr_supersample(text: &str) -> Result<String> {
+    const MAX_SS: f64 = 1.5;
+    let mut settings = serde_json::from_str::<serde_json::Value>(text)?;
+    let Some(values) = settings.as_object_mut() else {
+        return Ok(text.to_owned());
+    };
+    let Some(steamvr) = values.get_mut("steamvr").and_then(|v| v.as_object_mut()) else {
+        return Ok(text.to_owned());
+    };
+    let current = steamvr
+        .get("supersampleScale")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+    if current > MAX_SS {
+        debug!(
+            "Clamping steamvr.supersampleScale from {current} to {MAX_SS} for ALVR stability"
+        );
+        steamvr.insert("supersampleScale".into(), json!(MAX_SS));
+        // disableAsync already common with ALVR Linux; ensure present.
+        if !steamvr.contains_key("disableAsync") {
+            steamvr.insert("disableAsync".into(), json!(true));
+        }
+        return Ok(serde_json::to_string_pretty(&settings)?);
+    }
+    Ok(text.to_owned())
 }
 
 // Reads and writes back steamvr.vrsettings in order to

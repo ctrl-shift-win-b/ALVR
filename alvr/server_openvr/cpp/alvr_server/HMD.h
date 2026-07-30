@@ -3,7 +3,9 @@
 #include "ALVR-common/packet_types.h"
 #include "TrackedDevice.h"
 #include "openvr_driver_wrap.h"
+#include <atomic>
 #include <memory>
+#include <thread>
 #ifdef _WIN32
 #include "platform/win32/OvrDirectModeComponent.h"
 #endif
@@ -25,7 +27,9 @@ public:
 
     Hmd();
     virtual ~Hmd();
-    void OnPoseUpdated(uint64_t targetTimestampNs, FfiDeviceMotion motion);
+    void OnPoseUpdated(
+        uint64_t targetTimestampNs, FfiDeviceMotion motion, float poseTimeOffsetS
+    );
     void StartStreaming();
     void StopStreaming();
     void SetViewsConfig(FfiViewsConfig config);
@@ -55,8 +59,22 @@ private:
 
     std::shared_ptr<ViveTrackerProxy> m_viveTrackerProxy;
 
+    // Remaining STEREO Get* log lines after each ViewsConfig publish.
+    int m_stereoGetLogRemaining = 8;
+
 #ifndef _WIN32
     bool m_refreshRateSet = false;
+    // Display timing pump:
+    // - Idle: resubmit pose + VsyncEvent so StartVRCompositor does not 303.
+    // - Streaming: VsyncEvent only (DriverDirectModeSendsVsyncEvents=true).
+    //   Without continuous VsyncEvent after stream start, SteamVR frame pacing
+    //   collapses and client late-stage warp sees multi-second pose steps.
+    std::atomic_bool m_displayTimingRunning { false };
+    // When true, pump only fires VsyncEvent (client tracking owns poses).
+    std::atomic_bool m_displayTimingVsyncOnly { false };
+    std::thread m_displayTimingThread;
+    void start_display_timing_pump(bool vsync_only);
+    void stop_display_timing_pump();
 #endif
 
     // TrackedDevice

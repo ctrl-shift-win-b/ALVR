@@ -1245,21 +1245,66 @@ fn connection_pipeline(
                         ctx.events_sender.send(ServerCoreEvent::RequestIDR).ok();
                     }
                     ClientControlPacket::ViewsConfig(config) => {
-                        ctx.events_sender
-                            .send(ServerCoreEvent::ViewsConfig(ViewsConfig {
-                                local_view_transforms: [
-                                    Pose {
-                                        position: Vec3::new(-config.ipd_m / 2., 0., 0.),
-                                        orientation: Quat::IDENTITY,
-                                    },
-                                    Pose {
-                                        position: Vec3::new(config.ipd_m / 2., 0., 0.),
-                                        orientation: Quat::IDENTITY,
-                                    },
-                                ],
-                                fov: config.fov,
-                            }))
-                            .ok();
+                        // AVP App Store often sends garbage (±inf FOV, ipd=0) for the first
+                        // couple of seconds after stream start. Applying that (or even
+                        // delivering it to the driver) leaves SteamVR on dummy geometry and
+                        // mismatches client late-stage warp. Drop invalid packets here.
+                        let fov_ok = |f: &alvr_common::Fov| {
+                            f.left.is_finite()
+                                && f.right.is_finite()
+                                && f.up.is_finite()
+                                && f.down.is_finite()
+                                && f.left.abs() < 2.5
+                                && f.right.abs() < 2.5
+                                && f.up.abs() < 2.5
+                                && f.down.abs() < 2.5
+                                // OpenXR: left edge is negative, right positive (or equal).
+                                && f.left < f.right
+                                && f.down < f.up
+                        };
+                        let ipd_ok = config.ipd_m > 0.04 && config.ipd_m < 0.10;
+                        if !fov_ok(&config.fov[0]) || !fov_ok(&config.fov[1]) || !ipd_ok {
+                            warn!(
+                                "Dropping invalid ViewsConfig before driver: ipd={} fovL=[{},{},{},{}] fovR=[{},{},{},{}]",
+                                config.ipd_m,
+                                config.fov[0].left,
+                                config.fov[0].right,
+                                config.fov[0].up,
+                                config.fov[0].down,
+                                config.fov[1].left,
+                                config.fov[1].right,
+                                config.fov[1].up,
+                                config.fov[1].down,
+                            );
+                        } else {
+                            info!(
+                                "ViewsConfig accepted: ipd_m={:.4} fovL=[{:.3},{:.3},{:.3},{:.3}] fovR=[{:.3},{:.3},{:.3},{:.3}]",
+                                config.ipd_m,
+                                config.fov[0].left,
+                                config.fov[0].right,
+                                config.fov[0].up,
+                                config.fov[0].down,
+                                config.fov[1].left,
+                                config.fov[1].right,
+                                config.fov[1].up,
+                                config.fov[1].down,
+                            );
+                            ctx.events_sender
+                                .send(ServerCoreEvent::ViewsConfig(ViewsConfig {
+                                    local_view_transforms: [
+                                        Pose {
+                                            position: Vec3::new(-config.ipd_m / 2., 0., 0.),
+                                            orientation: Quat::IDENTITY,
+                                        },
+                                        Pose {
+                                            position: Vec3::new(config.ipd_m / 2., 0., 0.),
+                                            orientation: Quat::IDENTITY,
+                                        },
+                                    ],
+                                    fov: config.fov,
+                                }))
+                                .ok();
+                        }
                     }
                     ClientControlPacket::Battery(packet) => {
                         ctx.events_sender

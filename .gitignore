@@ -73,3 +73,7 @@ CMakeLists.txt
 cmake-build-debug/
 
 *.jks
+# Local diagnostics (do not publish)
+alvr-rca-*/
+**/session.json.bak*
+*.user

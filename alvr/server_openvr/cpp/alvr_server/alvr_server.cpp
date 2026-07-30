@@ -395,7 +395,11 @@ void SetTracking(
     int bodyTrackerMotionCount
 ) {
     if (g_driver_provider.hmd) {
-        g_driver_provider.hmd->OnPoseUpdated(targetTimestampNs, headMotion);
+        // HMD: Windows-like — client-predicted pose, zero vel/offset (see Hmd::OnPoseUpdated).
+        // Controllers still use controllerPoseTimeOffsetS below.
+        g_driver_provider.hmd->OnPoseUpdated(
+            targetTimestampNs, headMotion, /*poseTimeOffsetS=*/0.f
+        );
     }
 
     if (g_driver_provider.left_hand_tracker) {

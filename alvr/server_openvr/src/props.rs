@@ -299,12 +299,17 @@ pub extern "C" fn set_device_openvr_props(instance_ptr: *mut c_void, device_id: 
         // return a constant that's not 0 (invalid) or 1 (reserved for Oculus)
         set_prop(CurrentUniverseIdUint64, "2");
 
-        if cfg!(windows) {
-            // avoid "not fullscreen" warnings from vrmonitor
-            set_prop(IsOnDesktopBool, "false");
+        // avoid "not fullscreen" warnings from vrmonitor; also required so Linux
+        // treats the ALVR HMD as a non-desktop direct-mode display (capture layer).
+        set_prop(IsOnDesktopBool, "false");
 
+        if cfg!(windows) {
             // We let SteamVR handle VSyncs. We just wait in PostPresent().
             set_prop(DriverDirectModeSendsVsyncEventsBool, "false");
+        } else {
+            // Linux idle path: Hmd pose pump calls VsyncEvent at refresh rate so
+            // SteamVR StartVRCompositor readiness does not time out (303).
+            set_prop(DriverDirectModeSendsVsyncEventsBool, "true");
         }
         set_prop(DeviceProvidesBatteryStatusBool, "true");
         set_prop(ContainsProximitySensorBool, "true");
