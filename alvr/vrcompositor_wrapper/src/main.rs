@@ -72,12 +72,18 @@ fn main() {
         std::env::set_var("ALVR_LOG_DEBUG", "1");
     }
 
+    // Steam does not inherit shell ALVR_PROFILE — load ~/.config/alvr/profile.env
+    // so the capture layer can stamp submit_ns / write capture JSONL.
+    let profile_env = apply_profile_env_file_for_wrapper();
+    log_line(&mut log, &format!("profile.env: {profile_env}"));
+
     log_line(
         &mut log,
         &format!(
-            "VK_LAYER_PATH={} ALVR_SESSION_JSON={session_path} session_exists={}",
+            "VK_LAYER_PATH={} ALVR_SESSION_JSON={session_path} session_exists={} ALVR_PROFILE={:?}",
             layer_path.display(),
-            Path::new(&session_path).exists()
+            Path::new(&session_path).exists(),
+            std::env::var_os("ALVR_PROFILE"),
         ),
     );
 
@@ -155,6 +161,53 @@ fn main() {
     let err = exec::execvp(real_path, std::env::args());
     log_line(&mut log, &format!("Failed to run vrcompositor {err}"));
     println!("Failed to run vrcompositor {err}");
+}
+
+/// Load `~/.config/alvr/profile.env` into this process (and thus the real compositor).
+/// Process env wins when already set. Returns a short status string for the wrapper log.
+#[cfg(target_os = "linux")]
+fn apply_profile_env_file_for_wrapper() -> String {
+    use std::path::PathBuf;
+    let path = if let Ok(p) = std::env::var("ALVR_PROFILE_ENV_FILE") {
+        PathBuf::from(p)
+    } else if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg).join("alvr").join("profile.env")
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".config/alvr/profile.env")
+    } else {
+        return "no HOME / profile.env skipped".into();
+    };
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return format!("{} not found", path.display()),
+    };
+
+    let mut applied = 0u32;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if !key.starts_with("ALVR_PROFILE") {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+            applied += 1;
+        }
+    }
+    format!(
+        "{} applied_keys={} ALVR_PROFILE={:?}",
+        path.display(),
+        applied,
+        std::env::var_os("ALVR_PROFILE")
+    )
 }
 
 #[cfg(not(target_os = "linux"))]

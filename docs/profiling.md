@@ -8,35 +8,43 @@ see what arrives in `ClientStatistics`.
 
 | Variable | Values | Effect |
 |----------|--------|--------|
-| `ALVR_PROFILE` | unset / `0` / `off` | **Disabled** (default). One atomic check per span site. |
-| `ALVR_PROFILE` | `1` / `summary` | Aggregate **p50/p95/p99** every interval → ALVR log + JSONL summary |
+| `ALVR_PROFILE` | unset / `0` / `off` | Disabled if config file also off/missing |
+| `ALVR_PROFILE` | `1` / `summary` | Aggregate **p50/p95/p99** every interval → log + JSONL summary |
 | `ALVR_PROFILE` | `frame` | Summary + **per-span JSONL** lines |
 | `ALVR_PROFILE` | `detail` | Same as `frame` (reserved for finer marks) |
 | `ALVR_PROFILE_PATH` | path | Driver JSONL (default `/tmp/alvr-profile.jsonl`) |
 | `ALVR_PROFILE_LOG_MS` | ms | Summary interval (default `2000`) |
 | `ALVR_PROFILE_RING` | power-of-two size | In-memory ring capacity (default `65536`) |
 
-**Capture process** (vrcompositor + `VK_LAYER_ALVR_capture`) writes a sibling file when
-`ALVR_PROFILE` is `frame`/`detail`:
+### Steam-safe config file (Linux)
 
-- default: `/tmp/alvr-profile-capture.jsonl`
-- stamps `present_packet.submit_ns` always when connected (even in `summary`) so the driver
-  can measure **IPC present delay**.
+Steam-launched **`vrserver` does not inherit shell `export`**. Driver + wrapper read:
 
-### One-click with profiling
-
-```bash
-export ALVR_PROFILE=summary
-# optional:
-# export ALVR_PROFILE=frame
-# export ALVR_PROFILE_PATH=/tmp/alvr-profile.jsonl
-
-./scripts/restart-alvr-steamvr.sh
+```text
+~/.config/alvr/profile.env
 ```
 
-Ensure the env is visible to **both** the dashboard/driver **and** SteamVR/`vrcompositor`
-(wrapper inherits the environment from how you launch SteamVR). If capture JSONL is missing,
-the compositor did not see `ALVR_PROFILE`.
+`KEY=VALUE` lines for `ALVR_PROFILE*` only. Process env wins if already set.
+
+`./scripts/restart-alvr-steamvr.sh` writes this file every launch (default **`off`**).
+When enabled, it truncates the JSONL files so each measure session is clean.
+
+### One-click
+
+```bash
+./scripts/restart-alvr-steamvr.sh                    # profiling off (default)
+ALVR_PROFILE=summary ./scripts/restart-alvr-steamvr.sh
+ALVR_PROFILE=frame ./scripts/restart-alvr-steamvr.sh
+```
+
+**Verify (when enabled)**
+
+1. `grep "ALVR profiling: enabled" ~/.steam/debian-installation/logs/vrserver.txt`
+2. `/tmp/alvr-profile.jsonl` grows (`type:summary` every ~2s while streaming)
+3. Wrapper log: `profile.env: ... ALVR_PROFILE=Some("summary")`
+
+**Capture process** (layer): stamps `submit_ns` whenever connected; writes
+`/tmp/alvr-profile-capture.jsonl` only for `frame`/`detail`.
 
 ### Tracy (optional lab build)
 

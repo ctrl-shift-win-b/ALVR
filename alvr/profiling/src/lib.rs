@@ -1,13 +1,22 @@
 //! ALVR pipeline profiling.
 //!
 //! ## Runtime (always compiled, zero-ish cost when off)
-//! - `ALVR_PROFILE=0|off` — disabled (default)
+//! - `ALVR_PROFILE=0|off` — disabled (default if unset and no config file)
 //! - `ALVR_PROFILE=1|summary` — aggregate p50/p95/p99 every interval, no per-frame JSONL
 //! - `ALVR_PROFILE=frame` — summary + per-frame span lines to JSONL
 //! - `ALVR_PROFILE=detail` — frame + extra marks (mutex waits, etc.)
 //! - `ALVR_PROFILE_PATH` — JSONL output path (default `/tmp/alvr-profile.jsonl`)
 //! - `ALVR_PROFILE_LOG_MS` — summary log interval in ms (default `2000`)
 //! - `ALVR_PROFILE_RING` — ring capacity power-of-two (default `65536`)
+//!
+//! ## Config file (Steam-safe)
+//! Steam-launched `vrserver` does **not** inherit shell exports. The driver and
+//! `vrcompositor-wrapper` also read:
+//!   `~/.config/alvr/profile.env`  (or `$XDG_CONFIG_HOME/alvr/profile.env`)
+//!   override path: `ALVR_PROFILE_ENV_FILE`
+//!
+//! KEY=VALUE lines (`ALVR_PROFILE*`). Process env wins over the file when both set.
+//! `restart-alvr-steamvr.sh` writes this file so one-click runs always measure.
 //!
 //! ## Compile-time Tracy
 //! Build with feature `tracy` (wired as `alvr_server_core/trace-performance`) for Tracy zones.
@@ -17,8 +26,10 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::{
-    fs::OpenOptions,
+    env,
+    fs::{self, OpenOptions},
     io::Write,
+    path::PathBuf,
     sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     thread,
     time::{Duration, Instant},
@@ -280,6 +291,49 @@ impl State {
 
 static STATE: Lazy<Mutex<Option<State>>> = Lazy::new(|| Mutex::new(None));
 
+/// Path to the Steam-safe profile config (`KEY=VALUE` lines).
+pub fn profile_env_path() -> PathBuf {
+    if let Ok(p) = env::var("ALVR_PROFILE_ENV_FILE") {
+        return PathBuf::from(p);
+    }
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg).join("alvr").join("profile.env");
+    }
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home).join(".config/alvr/profile.env");
+    }
+    PathBuf::from("/tmp/alvr-profile.env")
+}
+
+/// Load `~/.config/alvr/profile.env` into the process environment for any
+/// `ALVR_PROFILE*` key that is **not** already set (process env wins).
+///
+/// Returns the path and whether the file was found.
+pub fn apply_profile_env_file() -> (PathBuf, bool) {
+    let path = profile_env_path();
+    let Ok(content) = fs::read_to_string(&path) else {
+        return (path, false);
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if !key.starts_with("ALVR_PROFILE") {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if env::var_os(key).is_none() {
+            env::set_var(key, value);
+        }
+    }
+    (path, true)
+}
+
 /// Call once at process start (safe to call repeatedly).
 pub fn init_from_env() {
     if INIT_DONE.swap(1, Ordering::SeqCst) == 1 {
@@ -287,22 +341,28 @@ pub fn init_from_env() {
         return;
     }
 
-    let raw = std::env::var("ALVR_PROFILE").unwrap_or_default();
+    let (cfg_path, cfg_found) = apply_profile_env_file();
+
+    let raw = env::var("ALVR_PROFILE").unwrap_or_default();
     let lvl = parse_level(&raw);
     LEVEL.store(lvl as u8, Ordering::SeqCst);
 
     if lvl == Level::Off {
-        log::info!("ALVR profiling: off (set ALVR_PROFILE=summary|frame|detail to enable)");
+        log::info!(
+            "ALVR profiling: off (set ALVR_PROFILE=summary|frame|detail, or write {}; file_found={})",
+            cfg_path.display(),
+            cfg_found
+        );
         return;
     }
 
-    let path = std::env::var("ALVR_PROFILE_PATH")
+    let path = env::var("ALVR_PROFILE_PATH")
         .unwrap_or_else(|_| "/tmp/alvr-profile.jsonl".to_string());
-    let log_ms: u64 = std::env::var("ALVR_PROFILE_LOG_MS")
+    let log_ms: u64 = env::var("ALVR_PROFILE_LOG_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2000);
-    let ring: usize = std::env::var("ALVR_PROFILE_RING")
+    let ring: usize = env::var("ALVR_PROFILE_RING")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_RING);
@@ -317,20 +377,24 @@ pub fn init_from_env() {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(
             f,
-            r#"{{"type":"header","level":"{}","path":"{}","pid":{},"ts_ns":{}}}"#,
+            r#"{{"type":"header","level":"{}","path":"{}","pid":{},"ts_ns":{},"cfg":"{}","cfg_found":{}}}"#,
             level_name(lvl),
             path,
             std::process::id(),
-            now_ns()
+            now_ns(),
+            cfg_path.display(),
+            cfg_found
         );
     }
 
     log::warn!(
-        "ALVR profiling: enabled level={} path={} log_every={}ms ring={}",
+        "ALVR profiling: enabled level={} path={} log_every={}ms ring={} cfg={} found={}",
         level_name(lvl),
         path,
         log_ms,
-        ring.next_power_of_two().max(1024)
+        ring.next_power_of_two().max(1024),
+        cfg_path.display(),
+        cfg_found
     );
 
     // Background flusher for summary lines (and periodic ring drain for frame mode)

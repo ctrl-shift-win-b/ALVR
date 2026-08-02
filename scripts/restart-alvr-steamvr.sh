@@ -11,6 +11,12 @@
 #   STEAM_ROOT          Steam library root (auto-detected if unset)
 #   ALVR_STREAM_NICE    renice value for vrcompositor/vrserver (default -5)
 #   STEAMVR_SETTINGS    path to steamvr.vrsettings (auto-detected if unset)
+#   ALVR_PROFILE        summary|frame|detail|off  (default: off)
+#                       Written to ~/.config/alvr/profile.env so Steam-launched
+#                       vrserver/vrcompositor see it (shell export alone is not enough).
+#                       Enable for a measure session: ALVR_PROFILE=summary ./scripts/...
+#   ALVR_PROFILE_PATH   JSONL path (default /tmp/alvr-profile.jsonl)
+#   ALVR_PROFILE_LOG_MS summary interval ms (default 2000)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -151,8 +157,45 @@ print("session ok, solidified=True")
 PY
 }
 
+# Steam children do not inherit this shell's exports. Write a file the driver and
+# vrcompositor-wrapper both load on startup.
+ensure_profile_env() {
+  local cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/alvr"
+  local f="${cfg_dir}/profile.env"
+  mkdir -p "$cfg_dir"
+  local level="${ALVR_PROFILE:-off}"
+  local path="${ALVR_PROFILE_PATH:-/tmp/alvr-profile.jsonl}"
+  local logms="${ALVR_PROFILE_LOG_MS:-2000}"
+  cat >"$f" <<EOF
+# Written by restart-alvr-steamvr.sh — read by driver + vrcompositor-wrapper
+# (Steam does not inherit shell ALVR_PROFILE.) Profiling is OFF by default.
+#   ALVR_PROFILE=summary ./scripts/restart-alvr-steamvr.sh
+#   ALVR_PROFILE=frame ./scripts/restart-alvr-steamvr.sh
+ALVR_PROFILE=${level}
+ALVR_PROFILE_PATH=${path}
+ALVR_PROFILE_LOG_MS=${logms}
+EOF
+  # Fresh JSONL per launch so sessions are easy to read
+  if [[ "${level}" != "off" && "${level}" != "0" && "${level}" != "false" ]]; then
+    : >"${path}" 2>/dev/null || true
+    # capture sibling
+    if [[ "${path}" == *.jsonl ]]; then
+      : >"${path%.jsonl}-capture.jsonl" 2>/dev/null || true
+    else
+      : >"${path}-capture.jsonl" 2>/dev/null || true
+    fi
+  fi
+  log "profile.env: ALVR_PROFILE=${level} path=${path} (cfg=${f})"
+}
+
 start_dashboard() {
   # Absolute path required so driver HmdDriverFactory path check passes.
+  # Also pass ALVR_PROFILE* for any code that runs in the dashboard process.
+  # shellcheck disable=SC1090
+  set -a
+  # shellcheck source=/dev/null
+  [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/alvr/profile.env" ]] && . "${XDG_CONFIG_HOME:-$HOME/.config}/alvr/profile.env"
+  set +a
   nohup "$DASHBOARD" >/tmp/alvr-dashboard.log 2>&1 &
   echo $! > /tmp/alvr-dashboard.pid
   sleep 1
@@ -179,6 +222,7 @@ log "repo=$REPO_ROOT"
 ensure_build
 stop_all
 touch_session
+ensure_profile_env
 register_driver
 wrap_compositor
 start_dashboard
@@ -226,6 +270,8 @@ fi
 log "Done. Connect headset client when SteamVR shows Ready."
 log "Logs: /tmp/alvr-dashboard.log  /tmp/alvr-vrcompositor-wrapper.log"
 log "      SteamVR logs: $(alvr_find_steamvr_logs 2>/dev/null || echo unset)"
+log "Profile: ~/.config/alvr/profile.env → /tmp/alvr-profile.jsonl (driver)"
+log "         look for 'ALVR profiling: enabled' in SteamVR logs/vrserver.txt"
 
 if (( RUN_SCORE )); then
   if [[ -x "${REPO_ROOT}/scripts/alvr-auto-rca.sh" ]]; then
