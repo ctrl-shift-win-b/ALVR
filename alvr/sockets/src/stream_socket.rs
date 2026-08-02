@@ -32,7 +32,9 @@ use std::{
     time::Duration,
 };
 
-const SHARD_PREFIX_SIZE: usize = mem::size_of::<u32>() // packet length - field itself (4 bytes)
+/// Bytes reserved at the front of each stream buffer for shard metadata.
+/// Used by the video path to pre-size a single-copy NAL buffer (headroom + payload).
+pub const SHARD_PREFIX_SIZE: usize = mem::size_of::<u32>() // packet length - field itself (4 bytes)
     + mem::size_of::<u16>() // stream ID
     + mem::size_of::<u32>() // packet index
     + mem::size_of::<u32>() // shards count
@@ -153,6 +155,44 @@ impl<H: Serialize> StreamSender<H> {
             inner: buffer,
             hidden_offset,
             length: 0,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Bytes to reserve before payload so [`Self::send_with_headroom`] can avoid a second NAL copy.
+    pub fn headroom_for(header: &H) -> Result<usize> {
+        Ok(SHARD_PREFIX_SIZE + bincode::serialized_size(header)? as usize)
+    }
+
+    /// Send a buffer laid out as `[headroom zeros/prefix+header][payload…]`.
+    ///
+    /// `body` must have been filled with `headroom == headroom_for(header)` leading bytes
+    /// (reserved) and the raw payload after that — typically one `copy`/`extend` from the
+    /// encoder into this vec. Serializes `header` into the reserved region and shards in place
+    /// with **no second payload memcpy**.
+    pub fn send_with_headroom(&mut self, header: &H, mut body: Vec<u8>, headroom: usize) -> Result<()> {
+        let header_size = bincode::serialized_size(header)? as usize;
+        let expected = SHARD_PREFIX_SIZE + header_size;
+        if headroom != expected || body.len() < headroom {
+            // Defensive fallback (should not happen on the video hot path).
+            let mut buffer = self.get_buffer(header)?;
+            let payload = if body.len() > headroom {
+                &body[headroom..]
+            } else {
+                &body[..]
+            };
+            buffer
+                .get_range_mut(0, payload.len())
+                .copy_from_slice(payload);
+            return self.send(buffer);
+        }
+
+        bincode::serialize_into(&mut body[SHARD_PREFIX_SIZE..headroom], header)?;
+        let length = body.len() - headroom;
+        self.send(Buffer {
+            inner: body,
+            hidden_offset: headroom,
+            length,
             _phantom: PhantomData,
         })
     }

@@ -493,7 +493,7 @@ pub unsafe extern "C" fn alvr_send_video_nal(
 ) {
     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
         let buffer = std::slice::from_raw_parts(buffer_ptr, len as usize);
-        context.send_video_nal(Duration::from_nanos(timestamp_ns), buffer.to_vec(), is_idr);
+        context.send_video_nal(Duration::from_nanos(timestamp_ns), buffer, is_idr);
     }
 }
 

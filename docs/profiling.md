@@ -99,14 +99,15 @@ jq -r 'select(.type=="span" and .stage=="encode_push") | .dur_us' /tmp/alvr-prof
 
 ## Interpreting hotspots (typical Linux + AVP / TCP)
 
-| High stage | Likely cause | Next optimization ideas |
-|------------|--------------|-------------------------|
-| `ipc_present_delay` | Encoder slower than compositor; UDS backlog | Overlap encode; drop older presents (already partially done) |
+| High stage | Likely cause | Notes / next ideas |
+|------------|--------------|--------------------|
+| `ipc_present_delay` | Encoder slower than compositor; UDS backlog | Overlap encode; scheduling/priority |
 | `render_gpu` | FFR/color compute | Reduce passes; resolution |
-| `encode_push` / `encode_get` | NVENC/VAAPI/SW encode + transfer | Codec settings; Vulkan→CUDA path |
-| `ffi_copy` + `stream_copy` | Extra full-NAL copies | Zero-copy encode → socket buffer |
+| `encode_push` / `encode_get` | Transfer + submit (NVENC itself is usually tiny on 30/40/50) | Vulkan→CUDA path |
+| `ffi_copy` | Single host copy of NAL into stream-ready body | Expected ~1× payload; `stream_copy` should be ~0 after headroom path |
+| `stream_copy` | Legacy second NAL memcpy | Should mark `extra=0` when eliminated |
 | `tcp_send` | Blocking TCP / congestion | Buffer sizes; writev; bitrate |
-| `stamp_pick` | PoseHistory lock + scan | Lock-free ring / O(1) lag index |
+| `stamp_pick` | PoseHistory (Linux skips matrix when pose unusable; lag is O(window)) | Stack pose scan still in compositor |
 
 Dashboard **Graph** stats remain the coarse motion-to-photon view; this profiler is the
 **fine-grained server breakdown**.

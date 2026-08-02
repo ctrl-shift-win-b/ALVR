@@ -95,27 +95,33 @@ PoseHistory::GetPoseNearAge(uint64_t age_ns) const {
     const uint64_t latest_ts = m_poseBuffer.back().targetTimestampNs;
     const uint64_t target_ts = (latest_ts > age_ns) ? (latest_ts - age_ns) : 0;
 
-    // Prefer sample at or before target_ts with smallest lag; else closest after.
-    const TrackingHistoryFrame* best = nullptr;
-    uint64_t best_err = UINT64_MAX;
-
-    for (const auto& f : m_poseBuffer) {
-        uint64_t err = (f.targetTimestampNs >= target_ts)
-            ? (f.targetTimestampNs - target_ts)
-            : (target_ts - f.targetTimestampNs);
-        // Prefer older-or-equal to target when errors equal (less LSW over-warp risk).
-        if (err < best_err
-            || (err == best_err && best
-                && f.targetTimestampNs < best->targetTimestampNs)) {
-            best_err = err;
-            best = &f;
-        }
+    // History is time-ordered (oldest front, newest back). Walk reverse from
+    // newest until we pass target_ts — O(samples in lag window), not O(full buffer).
+    // Pick closer of first-at-or-before-target and the sample just newer.
+    auto rit = m_poseBuffer.rbegin();
+    const TrackingHistoryFrame* newer = nullptr;
+    while (rit != m_poseBuffer.rend() && rit->targetTimestampNs > target_ts) {
+        newer = &(*rit);
+        ++rit;
     }
 
-    if (!best) {
-        return std::nullopt;
+    if (rit == m_poseBuffer.rend()) {
+        // All samples newer than target (tiny buffer / large age): use oldest.
+        return m_poseBuffer.front();
     }
-    return *best;
+
+    const TrackingHistoryFrame* at_or_before = &(*rit);
+    if (!newer) {
+        return *at_or_before;
+    }
+
+    const uint64_t err_old = target_ts - at_or_before->targetTimestampNs;
+    const uint64_t err_new = newer->targetTimestampNs - target_ts;
+    // Prefer older-or-equal on ties (less LSW over-warp risk).
+    if (err_new < err_old) {
+        return *newer;
+    }
+    return *at_or_before;
 }
 
 std::optional<PoseHistory::PoseMatch>
@@ -167,17 +173,61 @@ PoseHistory::GetBestPoseMatch(const vr::HmdMatrix34_t& pose) const {
     return result;
 }
 
+namespace {
+
+// Stack-scan in the capture layer often yields origin / unusable pose on Linux.
+// Full-history matrix match is wasted work in that case — go straight to time-lag.
+bool compositor_pose_usable_for_matrix(const vr::HmdMatrix34_t& pose) {
+    const float x = pose.m[0][3];
+    const float y = pose.m[1][3];
+    const float z = pose.m[2][3];
+    const float r2 = x * x + y * y + z * z;
+    if (r2 < 1e-6f) {
+        return false;
+    }
+    // Reject near-identity rotation with tiny translation noise (common fail mode).
+    // Cheap check: diagonal of R roughly 1 (not a full orthonormal test).
+    float diag = 0.f;
+    for (int i = 0; i < 3; i++) {
+        diag += pose.m[i][i];
+    }
+    // Identity rotation → trace ≈ 3; garbage/zero → ~0
+    if (diag < 1.5f) {
+        return false;
+    }
+    return true;
+}
+
+PoseHistory::PoseMatch match_from_lagged(
+    const PoseHistory::TrackingHistoryFrame& lagged,
+    const PoseHistory::TrackingHistoryFrame& latest,
+    const vr::HmdMatrix34_t& compositor_pose,
+    size_t history_size
+) {
+    PoseHistory::PoseMatch m;
+    m.frame = lagged;
+    m.latest = latest;
+    m.historySize = history_size;
+    m.usedLatestFallback = false;
+    m.compositorPos[0] = compositor_pose.m[0][3];
+    m.compositorPos[1] = compositor_pose.m[1][3];
+    m.compositorPos[2] = compositor_pose.m[2][3];
+    m.rotDistanceSq = 1e6f; // sentinel: matrix path skipped / not good
+    m.posDistanceSq = position_distance_sq(lagged.motion.position, compositor_pose);
+    m.posDistanceSqVsLatest = position_distance_sq(latest.motion.position, compositor_pose);
+    m.rotDistanceSqVsLatest = rotation_distance_sq(latest.rotationMatrix, compositor_pose);
+    if (latest.targetTimestampNs >= lagged.targetTimestampNs) {
+        m.ageVsLatestNs = latest.targetTimestampNs - lagged.targetTimestampNs;
+    }
+    return m;
+}
+
+} // namespace
+
 std::optional<PoseHistory::EncodeStamp> PoseHistory::PickEncodeStamp(
     const vr::HmdMatrix34_t& compositor_pose, uint64_t target_age_ns
 ) const {
-    auto matrix = GetBestPoseMatch(compositor_pose);
-    if (!matrix) {
-        return std::nullopt;
-    }
-
     EncodeStamp out;
-    out.matrixMatch = *matrix;
-    out.latest = matrix->latest;
     out.targetAgeNs = target_age_ns;
 
     // Thresholds from measurement goals:
@@ -186,31 +236,80 @@ std::optional<PoseHistory::EncodeStamp> PoseHistory::PickEncodeStamp(
     constexpr float kGoodRotDist = 0.02f;
     constexpr uint64_t kMaxMatrixAgeNs = 50'000'000ull; // 50ms
 
-    if (matrix->rotDistanceSq <= kGoodRotDist && matrix->ageVsLatestNs <= kMaxMatrixAgeNs) {
-        out.frame = matrix->frame;
-        out.method = StampMethod::MatrixGood;
-        out.actualAgeNs = matrix->ageVsLatestNs;
-        return out;
+    // Linux: stack-scanned compositor pose rarely matches tracking history.
+    // Skip O(N) matrix scan when pose is unusable; use time-lag (O(lag window)).
+    const bool try_matrix =
+#ifndef __linux__
+        true
+#else
+        compositor_pose_usable_for_matrix(compositor_pose)
+#endif
+        ;
+
+    if (try_matrix) {
+        auto matrix = GetBestPoseMatch(compositor_pose);
+        if (!matrix) {
+            return std::nullopt;
+        }
+
+        out.matrixMatch = *matrix;
+        out.latest = matrix->latest;
+
+        if (matrix->rotDistanceSq <= kGoodRotDist && matrix->ageVsLatestNs <= kMaxMatrixAgeNs) {
+            out.frame = matrix->frame;
+            out.method = StampMethod::MatrixGood;
+            out.actualAgeNs = matrix->ageVsLatestNs;
+            return out;
+        }
     }
 
-    // Linux typical path: stack-scanned pose does not match history well.
-    // Stamp a pose that is consistently ~target_age behind "now" so:
+    // Stamp a pose consistently ~target_age behind "now" so:
     // - timestamps advance every tracking sample (LSW not frozen)
     // - stamp is NOT "latest" (LSW does not over-warp / fight the image)
-    auto lagged = GetPoseNearAge(target_age_ns);
-    if (lagged) {
-        out.frame = *lagged;
+    // Single lock for lag pick + latest + hist size (avoid lock thrash on encode path).
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_poseBuffer.empty()) {
+            return std::nullopt;
+        }
+
+        const TrackingHistoryFrame& latest_ref = m_poseBuffer.back();
+        out.latest = latest_ref;
+        const size_t hist_size = m_poseBuffer.size();
+
+        const uint64_t latest_ts = latest_ref.targetTimestampNs;
+        const uint64_t target_ts = (latest_ts > target_age_ns) ? (latest_ts - target_age_ns) : 0;
+
+        auto rit = m_poseBuffer.rbegin();
+        const TrackingHistoryFrame* newer = nullptr;
+        while (rit != m_poseBuffer.rend() && rit->targetTimestampNs > target_ts) {
+            newer = &(*rit);
+            ++rit;
+        }
+
+        const TrackingHistoryFrame* chosen = nullptr;
+        if (rit == m_poseBuffer.rend()) {
+            chosen = &m_poseBuffer.front();
+        } else {
+            const TrackingHistoryFrame* at_or_before = &(*rit);
+            if (!newer) {
+                chosen = at_or_before;
+            } else {
+                const uint64_t err_old = target_ts - at_or_before->targetTimestampNs;
+                const uint64_t err_new = newer->targetTimestampNs - target_ts;
+                chosen = (err_new < err_old) ? newer : at_or_before;
+            }
+        }
+
+        out.frame = *chosen;
         out.method = StampMethod::TimeLag;
         if (out.latest.targetTimestampNs >= out.frame.targetTimestampNs) {
             out.actualAgeNs = out.latest.targetTimestampNs - out.frame.targetTimestampNs;
         }
+        out.matrixMatch
+            = match_from_lagged(out.frame, out.latest, compositor_pose, hist_size);
         return out;
     }
-
-    out.frame = matrix->latest;
-    out.method = StampMethod::Latest;
-    out.actualAgeNs = 0;
-    return out;
 }
 
 std::optional<PoseHistory::TrackingHistoryFrame> PoseHistory::GetPoseAt(uint64_t timestampNs

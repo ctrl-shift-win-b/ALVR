@@ -341,9 +341,9 @@ extern "C" fn set_video_config_nals(buffer_ptr: *const u8, len: i32, codec: i32)
 
 extern "C" fn send_video(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_idr: bool) {
     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
-        let _span = alvr_profiling::Span::with_extra(Stage::FfiCopy, timestamp_ns, len as u64);
+        // One copy into stream-ready body happens inside send_video_nal (no intermediate Vec).
         let buffer = unsafe { std::slice::from_raw_parts(buffer_ptr, len as usize) };
-        context.send_video_nal(Duration::from_nanos(timestamp_ns), buffer.to_vec(), is_idr);
+        context.send_video_nal(Duration::from_nanos(timestamp_ns), buffer, is_idr);
     }
 }
 

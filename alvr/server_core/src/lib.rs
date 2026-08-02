@@ -371,7 +371,7 @@ impl ServerCoreContext {
         });
     }
 
-    pub fn send_video_nal(&self, target_timestamp: Duration, nal_buffer: Vec<u8>, is_idr: bool) {
+    pub fn send_video_nal(&self, target_timestamp: Duration, nal: &[u8], is_idr: bool) {
         dbg_server_core!("send_video_nal");
 
         // start in the corrupts state, the client didn't receive the initial IDR yet.
@@ -379,12 +379,11 @@ impl ServerCoreContext {
         static LAST_IDR_INSTANT: Lazy<Mutex<Instant>> = Lazy::new(|| Mutex::new(Instant::now()));
 
         let frame_id = target_timestamp.as_nanos() as u64;
+        let buffer_size = nal.len();
         let _enqueue_span =
-            alvr_profiling::Span::with_extra(Stage::ChannelEnqueue, frame_id, nal_buffer.len() as u64);
+            alvr_profiling::Span::with_extra(Stage::ChannelEnqueue, frame_id, buffer_size as u64);
 
         if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
-            let buffer_size = nal_buffer.len();
-
             if is_idr {
                 STREAM_CORRUPTED.store(false, Ordering::SeqCst);
             }
@@ -421,21 +420,45 @@ impl ServerCoreContext {
                     .connection
                     .avoid_video_glitching
             {
-                if let Some(sender) = &*self.connection_context.video_mirror_sender.lock() {
-                    sender.send(nal_buffer.clone()).ok();
+                if let Some(mirror) = &*self.connection_context.video_mirror_sender.lock() {
+                    mirror.send(nal.to_vec()).ok();
                 }
 
                 if let Some(file) = &mut *self.connection_context.video_recording_file.lock() {
-                    file.write_all(&nal_buffer).ok();
+                    file.write_all(nal).ok();
                 }
+
+                // Single host copy of the NAL: reserve stream headroom, copy payload once.
+                // Network thread serializes the header in-place and shards without a 2nd memcpy.
+                let header = VideoPacketHeader {
+                    timestamp: target_timestamp,
+                    is_idr,
+                };
+                let headroom = match alvr_sockets::StreamSender::<VideoPacketHeader>::headroom_for(
+                    &header,
+                ) {
+                    Ok(h) => h,
+                    Err(_) => {
+                        warn!("Dropping video packet. Reason: header size failed");
+                        return;
+                    }
+                };
+
+                let _ffi_copy = alvr_profiling::Span::with_extra(
+                    Stage::FfiCopy,
+                    frame_id,
+                    buffer_size as u64,
+                );
+                let mut body = Vec::with_capacity(headroom + buffer_size);
+                body.resize(headroom, 0);
+                body.extend_from_slice(nal);
+                drop(_ffi_copy);
 
                 if matches!(
                     sender.try_send(VideoPacket {
-                        header: VideoPacketHeader {
-                            timestamp: target_timestamp,
-                            is_idr
-                        },
-                        payload: nal_buffer,
+                        header,
+                        body,
+                        headroom,
                     }),
                     Err(TrySendError::Full(_))
                 ) {

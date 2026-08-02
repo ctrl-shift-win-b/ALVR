@@ -49,7 +49,10 @@ const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
 pub struct VideoPacket {
     pub header: VideoPacketHeader,
-    pub payload: Vec<u8>,
+    /// Layout: `[headroom reserved][NAL bytes…]` when `headroom > 0`.
+    /// Single copy from encoder into this vec; network thread sends without a second NAL copy.
+    pub body: Vec<u8>,
+    pub headroom: usize,
 }
 
 fn align32(value: f32) -> u32 {
@@ -929,40 +932,36 @@ fn connection_pipeline(
         let client_hostname = client_hostname.clone();
         move || {
             while is_streaming(&client_hostname) {
-                let VideoPacket { header, payload } =
-                    match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
-                        Ok(packet) => packet,
-                        Err(RecvTimeoutError::Timeout) => continue,
-                        Err(RecvTimeoutError::Disconnected) => return,
-                    };
+                let VideoPacket {
+                    header,
+                    body,
+                    headroom,
+                } = match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
+                    Ok(packet) => packet,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                };
 
                 let frame_id = header.timestamp.as_nanos() as u64;
-                let payload_len = payload.len() as u64;
+                let payload_len = body.len().saturating_sub(headroom) as u64;
                 alvr_profiling::mark(
                     alvr_profiling::Stage::ChannelDequeue,
                     frame_id,
                     payload_len,
                 );
 
-                let mut buffer = video_sender.get_buffer(&header).unwrap();
-                // todo: make encoder write to socket buffers directly to avoid copy
-                {
-                    let _copy = alvr_profiling::Span::with_extra(
-                        alvr_profiling::Stage::StreamCopy,
-                        frame_id,
-                        payload_len,
-                    );
-                    buffer
-                        .get_range_mut(0, payload.len())
-                        .copy_from_slice(&payload);
-                }
+                // body is already [headroom][NAL] — serialize header in-place, shard, no 2nd NAL copy
                 {
                     let _send = alvr_profiling::Span::with_extra(
                         alvr_profiling::Stage::TcpSend,
                         frame_id,
                         payload_len,
                     );
-                    video_sender.send(buffer).ok();
+                    // Mark zero-length stream_copy so profiles show the copy was eliminated.
+                    alvr_profiling::mark(alvr_profiling::Stage::StreamCopy, frame_id, 0);
+                    video_sender
+                        .send_with_headroom(&header, body, headroom)
+                        .ok();
                 }
             }
         }
