@@ -71,6 +71,15 @@ fn main() {
         env::set_var("WINIT_X11_SCALE_FACTOR", "1");
     }
 
+    // Persist window position/size under the ALVR config dir (e.g. ~/.config/alvr/).
+    // eframe's "persistence" feature auto-saves on interval and on exit.
+    let layout = get_filesystem_layout();
+    let _ = fs::create_dir_all(&layout.config_dir);
+    let persistence_path = layout.config_dir.join("dashboard_window.ron");
+    // First launch: no saved geometry yet → center. Later launches: restore last geometry
+    // (centered must be false or it overwrites the restored position).
+    let has_saved_geometry = persistence_path.is_file();
+
     eframe::run_native(
         &format!("ALVR Dashboard (streamer v{})", *ALVR_VERSION),
         NativeOptions {
@@ -82,7 +91,9 @@ fn main() {
                     width: image.width(),
                     height: image.height(),
                 }),
-            centered: true,
+            centered: !has_saved_geometry,
+            persist_window: true,
+            persistence_path: Some(persistence_path),
             ..Default::default()
         },
         {

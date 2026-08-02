@@ -361,6 +361,8 @@ pub fn tracking_loop(
         };
 
         let timestamp = tracking.target_timestamp;
+        let frame_id = timestamp.as_nanos() as u64;
+        let _tracking_span = alvr_profiling::Span::new(alvr_profiling::Stage::TrackingRx, frame_id);
 
         if let Some(stats) = &mut *ctx.statistics_manager.write() {
             stats.report_tracking_received(timestamp);

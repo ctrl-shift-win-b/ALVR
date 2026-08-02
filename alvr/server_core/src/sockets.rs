@@ -7,7 +7,7 @@ use flume::TryRecvError;
 use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent};
 use std::{
     collections::HashMap,
-    net::{IpAddr, UdpSocket},
+    net::{IpAddr, Ipv6Addr, UdpSocket},
 };
 
 pub struct WelcomeSocket {
@@ -66,7 +66,7 @@ impl WelcomeSocket {
                             .trim_end_matches('\x00')
                             .to_owned();
 
-                        clients.insert(hostname, address.ip());
+                        insert_client_address(&mut clients, hostname, address.ip());
                     } else if &self.buffer[..16]
                         == b"\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00ALVR"
                         || &self.buffer[..5] == b"\x01ALVR"
@@ -90,7 +90,18 @@ impl WelcomeSocket {
                         let hostname = info
                             .get_property_val_str(alvr_sockets::MDNS_DEVICE_ID_KEY)
                             .unwrap_or_else(|| info.get_hostname());
-                        let address = *info.get_addresses().iter().next().to_any()?;
+
+                        // mDNS often lists link-local IPv6 first. Connecting to
+                        // fe80::… without a scope id fails with EINVAL (os error 22)
+                        // on Linux — prefer a global IPv4 when present.
+                        let Some(address) = pick_connectable_address(info.get_addresses().iter().copied())
+                        else {
+                            warn!(
+                                "Found client {hostname} via mDNS but no connectable address \
+                                 (skipped link-local IPv6 without scope)"
+                            );
+                            continue;
+                        };
 
                         let client_protocol = info
                             .get_property_val_str(alvr_sockets::MDNS_PROTOCOL_KEY)
@@ -115,7 +126,7 @@ impl WelcomeSocket {
                             warn!("Found incompatible client {hostname}! {reason}\n{protocols}");
                         }
 
-                        clients.insert(hostname.into(), address);
+                        insert_client_address(&mut clients, hostname.into(), address);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -124,5 +135,48 @@ impl WelcomeSocket {
         }
 
         Ok(clients)
+    }
+}
+
+/// Prefer global IPv4, then global IPv6. Skip unspecified/loopback and
+/// IPv6 link-local (needs a scope id that mDNS does not give us).
+fn pick_connectable_address(addrs: impl IntoIterator<Item = IpAddr>) -> Option<IpAddr> {
+    let mut best_v4 = None;
+    let mut best_v6 = None;
+
+    for addr in addrs {
+        match addr {
+            IpAddr::V4(ip) if !ip.is_unspecified() && !ip.is_loopback() && !ip.is_broadcast() => {
+                best_v4.get_or_insert(addr);
+            }
+            IpAddr::V6(ip)
+                if !ip.is_unspecified()
+                    && !ip.is_loopback()
+                    && !is_unicast_link_local_v6(ip)
+                    && !ip.is_multicast() =>
+            {
+                best_v6.get_or_insert(addr);
+            }
+            _ => {}
+        }
+    }
+
+    best_v4.or(best_v6)
+}
+
+fn is_unicast_link_local_v6(ip: Ipv6Addr) -> bool {
+    // fe80::/10
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// Keep the better of two candidates for the same hostname (IPv4 wins).
+fn insert_client_address(clients: &mut HashMap<String, IpAddr>, hostname: String, address: IpAddr) {
+    match clients.get(&hostname) {
+        Some(existing) if existing.is_ipv4() && address.is_ipv6() => {
+            // Keep IPv4
+        }
+        _ => {
+            clients.insert(hostname, address);
+        }
     }
 }

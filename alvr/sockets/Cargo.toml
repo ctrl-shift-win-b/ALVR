@@ -7,14 +7,15 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-trace-performance = ["profiling/profile-with-tracy"]
+# Enables Tracy zones inside socket send when built with alvr_server_core/trace-performance
+trace-performance = ["alvr_profiling/tracy"]
 
 [dependencies]
 alvr_common.workspace = true
+alvr_profiling.workspace = true
 alvr_session.workspace = true
 
 bincode = "1"
-profiling = { version = "1", optional = true }
 serde = "1"
 serde_json = "1"
 socket2 = "0.5"

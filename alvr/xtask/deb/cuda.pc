@@ -1,9 +1,10 @@
-prefix=/usr/lib/cuda
+prefix=/usr/local/cuda
+exec_prefix=${prefix}
 includedir=${prefix}/include
 libdir=${prefix}/lib64
 
 Name: cuda
-Description: CUDA Driver Library
-Version: 0.0.0
-Libs: -L${libdir}/stubs -lcuda
+Description: NVIDIA CUDA Toolkit
+Version: 13.2
+Libs: -L${libdir} -L${libdir}/stubs -lcuda -lcudart
 Cflags: -I${includedir}

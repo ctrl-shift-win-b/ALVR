@@ -14,6 +14,16 @@ extern "C" {
 #include <libavutil/opt.h>
 }
 
+// FFmpeg n6.0 uses FF_PROFILE_*; newer trees renamed to AV_PROFILE_*.
+#ifndef AV_PROFILE_H264_BASELINE
+#define AV_PROFILE_H264_BASELINE FF_PROFILE_H264_BASELINE
+#define AV_PROFILE_H264_MAIN FF_PROFILE_H264_MAIN
+#define AV_PROFILE_H264_HIGH FF_PROFILE_H264_HIGH
+#define AV_PROFILE_HEVC_MAIN FF_PROFILE_HEVC_MAIN
+#define AV_PROFILE_HEVC_MAIN_10 FF_PROFILE_HEVC_MAIN_10
+#define AV_PROFILE_AV1_MAIN FF_PROFILE_AV1_MAIN
+#endif
+
 namespace {
 
 const char* encoder(ALVR_CODEC codec) {

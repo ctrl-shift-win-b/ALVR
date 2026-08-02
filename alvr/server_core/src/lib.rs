@@ -24,6 +24,7 @@ use alvr_common::{
     warn, ConnectionState, DeviceMotion, Fov, LifecycleState, Pose, RelaxedAtomic,
     DEVICE_ID_TO_PATH,
 };
+use alvr_profiling::Stage;
 use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
@@ -69,6 +70,9 @@ pub fn initialize_environment(layout: afs::Layout) {
 
     // This ensures that the session is written to disk
     SESSION_MANAGER.write().session_mut();
+
+    // Env-gated pipeline profiler (ALVR_PROFILE). Safe if already inited by driver.
+    alvr_profiling::init_from_env();
 }
 
 // todo: use this as the network packet
@@ -373,6 +377,10 @@ impl ServerCoreContext {
         // start in the corrupts state, the client didn't receive the initial IDR yet.
         static STREAM_CORRUPTED: AtomicBool = AtomicBool::new(true);
         static LAST_IDR_INSTANT: Lazy<Mutex<Instant>> = Lazy::new(|| Mutex::new(Instant::now()));
+
+        let frame_id = target_timestamp.as_nanos() as u64;
+        let _enqueue_span =
+            alvr_profiling::Span::with_extra(Stage::ChannelEnqueue, frame_id, nal_buffer.len() as u64);
 
         if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
             let buffer_size = nal_buffer.len();

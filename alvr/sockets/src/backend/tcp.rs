@@ -1,12 +1,15 @@
 use crate::LOCAL_IP;
 
 use super::{SocketReader, SocketWriter};
-use alvr_common::{anyhow::Result, con_bail, ConResult, HandleTryAgain, ToCon};
+use alvr_common::{
+    anyhow::Result, con_bail, info, warn, ConResult, HandleTryAgain, ToCon,
+};
 use alvr_session::{DscpTos, SocketBufferSize};
 use std::{
     io::Read,
     io::Write,
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    thread,
     time::Duration,
 };
 
@@ -58,18 +61,78 @@ pub fn connect_to_client(
     send_buffer_bytes: SocketBufferSize,
     recv_buffer_bytes: SocketBufferSize,
 ) -> ConResult<(TcpStream, TcpStream)> {
-    let split_timeout = timeout / client_ips.len() as u32;
+    if client_ips.is_empty() {
+        con_bail!("No client IPs to connect to");
+    }
 
-    let mut res = alvr_common::try_again();
-    for ip in client_ips {
-        res = TcpStream::connect_timeout(&SocketAddr::new(*ip, port), split_timeout)
-            .handle_try_again();
+    // Prefer IPv4: mDNS often yields link-local IPv6 that fails with EINVAL (22)
+    // when used without a scope id. Also map IPv4-mapped IPv6 to real IPv4.
+    let mut ordered: Vec<IpAddr> = client_ips
+        .iter()
+        .map(|ip| match ip {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(*ip),
+            other => *other,
+        })
+        .collect();
+    ordered.sort_by_key(|ip| if ip.is_ipv4() { 0u8 } else { 1u8 });
+    ordered.dedup();
 
-        if res.is_ok() {
+    // Client control listen is intermittent; give each IP a longer window.
+    let split_timeout = (timeout / ordered.len() as u32).max(Duration::from_millis(500));
+
+    let mut last_err: Option<std::io::Error> = None;
+    let mut socket_tcp: Option<TcpStream> = None;
+    for ip in &ordered {
+        // Skip unusable link-local IPv6 (no interface scope from discovery).
+        if let IpAddr::V6(v6) = ip {
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                warn!(
+                    "Skipping link-local IPv6 {ip} for control connect (would cause EINVAL)"
+                );
+                continue;
+            }
+        }
+
+        // A few quick retries: AVP opens :9943 only while advertising.
+        for attempt in 0..3u32 {
+            match TcpStream::connect_timeout(&SocketAddr::new(*ip, port), split_timeout) {
+                Ok(s) => {
+                    info!("Control TCP connected to {ip}:{port} (attempt {})", attempt + 1);
+                    socket_tcp = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        "Control connect to {ip}:{port} attempt {} failed: {e} (os={:?})",
+                        attempt + 1,
+                        e.raw_os_error()
+                    );
+                    last_err = Some(e);
+                    thread::sleep(Duration::from_millis(150));
+                }
+            }
+        }
+        if socket_tcp.is_some() {
             break;
         }
     }
-    let socket = res?.into();
+
+    let socket = match socket_tcp {
+        Some(s) => s.into(),
+        None => {
+            return Err(match last_err {
+                Some(e) => std::result::Result::<TcpStream, _>::Err(e)
+                    .handle_try_again()
+                    .unwrap_err(),
+                None => alvr_common::ConnectionError::Other(alvr_common::anyhow::anyhow!(
+                    "No client IPs could be connected"
+                )),
+            });
+        }
+    };
 
     crate::set_socket_buffers(&socket, send_buffer_bytes, recv_buffer_bytes).ok();
     socket.set_read_timeout(Some(timeout)).to_con()?;

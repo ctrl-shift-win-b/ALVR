@@ -39,6 +39,19 @@ This fork changes that lifecycle:
 
 End state: solidify once → one-click launch → connect headset → stream, without SteamVR rebooting on every link.
 
+## Pipeline profiling (find latency)
+
+Server-side stage timers (capture → encode → TCP → …) are env-gated and off by default:
+
+```bash
+export ALVR_PROFILE=summary   # or frame / detail
+./scripts/restart-alvr-steamvr.sh
+# watch session log for "PROFILE summary …"
+# JSONL: /tmp/alvr-profile.jsonl  (+ capture: /tmp/alvr-profile-capture.jsonl)
+```
+
+Full stage map and Tracy lab builds: **[docs/profiling.md](docs/profiling.md)**.
+
 ## Known limits and issues (this fork)
 
 ### NVIDIA encoder resolution (Linux / current drivers)
@@ -149,6 +162,10 @@ What it does: stop old processes → mark session solidified / soft session defa
 Optional env: `STEAM_ROOT`, `ALVR_STREAM_NICE` (default `-5`), `STEAMVR_SETTINGS`.
 
 Typical first-time flow: **build** → open dashboard once → **Hard Config → Apply AVP defaults → Solidify** (or rely on the script’s session touch after you have a session.json) → **`./scripts/restart-alvr-steamvr.sh`** → wait for SteamVR Ready → open the headset client.
+
+### Sharing binaries / portable packaging (later)
+
+The streamer **cannot** be a single fully static binary (SteamVR OpenVR driver plugin + Vulkan layer + compositor wrapper + host GPU/PipeWire). The practical share unit is the **streamer directory** (~12 files) or `cargo xtask package-streamer`. Notes, constraints, and a sketch for a future `package-portable-linux` (private libs + `$ORIGIN` rpath / AppImage) are in **[docs/linux-portable-packaging.md](docs/linux-portable-packaging.md)**.
 
 ---
 

@@ -20,6 +20,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "ALVR-common/alvr_profile.h"
 #include "ALVR-common/packet_types.h"
 #include "EncodePipeline.h"
 #include "FrameRender.h"
@@ -260,7 +261,22 @@ void CEncoder::Run() {
         uint64_t present_count = 0;
         uint64_t pose_miss_count = 0;
         while (not m_exiting) {
-            read_latest(client, (char*)&frame_info, sizeof(frame_info), m_exiting);
+            {
+                alvr_profile::Span present_recv(ALVR_PROF_PRESENT_RECV, 0);
+                read_latest(client, (char*)&frame_info, sizeof(frame_info), m_exiting);
+            }
+
+            // Correlate capture→encoder IPC delay via present_packet.submit_ns
+            if (frame_info.submit_ns != 0 && alvr_profile::enabled()) {
+                const uint64_t now = alvr_profile::now_ns();
+                alvr_profile::record(
+                    ALVR_PROF_IPC_PRESENT_DELAY,
+                    (uint64_t)frame_info.frame,
+                    frame_info.submit_ns,
+                    now,
+                    0
+                );
+            }
 
             encode_pipeline->SetParams(GetDynamicEncoderParams());
 
@@ -287,9 +303,13 @@ void CEncoder::Run() {
             if (target_age_ns > one_frame_ns * 4)
                 target_age_ns = one_frame_ns * 4;
 
-            auto stamp = m_poseHistory->PickEncodeStamp(
-                (const vr::HmdMatrix34_t&)frame_info.pose, target_age_ns
-            );
+            std::optional<PoseHistory::EncodeStamp> stamp;
+            {
+                alvr_profile::Span stamp_span(ALVR_PROF_STAMP_PICK, 0);
+                stamp = m_poseHistory->PickEncodeStamp(
+                    (const vr::HmdMatrix34_t&)frame_info.pose, target_age_ns
+                );
+            }
             if (!stamp) {
                 pose_miss_count++;
                 if (pose_miss_count <= 5 || (pose_miss_count % 500) == 0) {
@@ -317,21 +337,30 @@ void CEncoder::Run() {
                 );
             }
 
-            render.Render(frame_info.image, frame_info.semaphore_value);
+            {
+                alvr_profile::Span render_span(ALVR_PROF_RENDER_GPU, pose_ts);
+                render.Render(frame_info.image, frame_info.semaphore_value);
+            }
 
             if (!valid_timestamps) {
                 ReportPresent(pose_ts, 0);
                 ReportComposed(pose_ts, 0);
             }
 
-            encode_pipeline->PushFrame(pose_ts, m_scheduler.CheckIDRInsertion());
+            {
+                alvr_profile::Span push_span(ALVR_PROF_ENCODE_PUSH, pose_ts);
+                encode_pipeline->PushFrame(pose_ts, m_scheduler.CheckIDRInsertion());
+            }
 
             static_assert(sizeof(frame_info.pose) == sizeof(vr::HmdMatrix34_t&));
 
             alvr::FramePacket packet;
-            if (!encode_pipeline->GetEncoded(packet)) {
-                Error("Failed to get encoded data!");
-                continue;
+            {
+                alvr_profile::Span get_span(ALVR_PROF_ENCODE_GET, pose_ts);
+                if (!encode_pipeline->GetEncoded(packet)) {
+                    Error("Failed to get encoded data!");
+                    continue;
+                }
             }
 
             uint64_t present_offset = 0;
@@ -492,9 +521,16 @@ void CEncoder::Run() {
                 }
             }
 
-            ParseFrameNals(
-                encode_pipeline->GetCodec(), packet.data, packet.size, packet.pts, packet.isIDR
-            );
+            {
+                alvr_profile::Span nal_span(ALVR_PROF_NAL_PARSE, pose_ts);
+                ParseFrameNals(
+                    encode_pipeline->GetCodec(),
+                    packet.data,
+                    packet.size,
+                    packet.pts,
+                    packet.isIDR
+                );
+            }
         }
     } catch (std::exception& e) {
         std::stringstream err;

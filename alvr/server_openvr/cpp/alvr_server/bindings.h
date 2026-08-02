@@ -133,6 +133,22 @@ extern "C" void (*SetOpenvrProps)(void* instancePtr, unsigned long long deviceID
 extern "C" void (*RegisterButtons)(void* instancePtr, unsigned long long deviceID);
 extern "C" void (*WaitForVSync)();
 
+// Profiling (ALVR_PROFILE env). Null/no-op when unset. See ALVR-common/alvr_profile.h
+extern "C" unsigned char (*ProfileEnabled)();
+extern "C" unsigned long long (*ProfileNowNs)();
+extern "C" void (*ProfileSpanBegin)(unsigned int stage, unsigned long long frame_id);
+extern "C" void (*ProfileSpanEnd)(unsigned int stage);
+extern "C" void (*ProfileRecord)(
+    unsigned int stage,
+    unsigned long long frame_id,
+    unsigned long long start_ns,
+    unsigned long long end_ns,
+    unsigned long long extra
+);
+extern "C" void (*ProfileMark)(
+    unsigned int stage, unsigned long long frame_id, unsigned long long extra
+);
+
 extern "C" void CppInit(bool earlyHmdInitialization);
 extern "C" void* CppOpenvrEntryPoint(const char* pInterfaceName, int* pReturnCode);
 extern "C" bool InitializeStreaming();

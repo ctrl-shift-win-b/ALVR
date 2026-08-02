@@ -20,6 +20,7 @@ use alvr_common::{
 };
 use alvr_filesystem as afs;
 use alvr_packets::{ButtonValue, Haptics};
+use alvr_profiling::{self, Stage};
 use alvr_server_core::{HandType, ServerCoreContext, ServerCoreEvent};
 use alvr_session::{CodecType, ControllersConfig};
 use std::{
@@ -90,6 +91,10 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                     });
                 },
                 ServerCoreEvent::Tracking { sample_timestamp } => {
+                    let _pose_span = alvr_profiling::Span::new(
+                        Stage::PosePublish,
+                        sample_timestamp.as_nanos() as u64,
+                    );
                     let headset_config = &alvr_server_core::settings().headset;
 
                     let controllers_config = headset_config.controllers.clone().into_option();
@@ -336,9 +341,36 @@ extern "C" fn set_video_config_nals(buffer_ptr: *const u8, len: i32, codec: i32)
 
 extern "C" fn send_video(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_idr: bool) {
     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        let _span = alvr_profiling::Span::with_extra(Stage::FfiCopy, timestamp_ns, len as u64);
         let buffer = unsafe { std::slice::from_raw_parts(buffer_ptr, len as usize) };
         context.send_video_nal(Duration::from_nanos(timestamp_ns), buffer.to_vec(), is_idr);
     }
+}
+
+// C++ profile function-pointer targets (see bindings.h / alvr_profile.h)
+extern "C" fn profile_enabled() -> u8 {
+    alvr_profiling::enabled() as u8
+}
+extern "C" fn profile_now_ns() -> u64 {
+    alvr_profiling::now_ns()
+}
+extern "C" fn profile_span_begin(stage: u32, frame_id: u64) {
+    alvr_profiling::alvr_profile_span_begin(stage as u8, frame_id);
+}
+extern "C" fn profile_span_end(stage: u32) {
+    alvr_profiling::alvr_profile_span_end(stage as u8);
+}
+extern "C" fn profile_record(
+    stage: u32,
+    frame_id: u64,
+    start_ns: u64,
+    end_ns: u64,
+    extra: u64,
+) {
+    alvr_profiling::alvr_profile_record(stage as u8, frame_id, start_ns, end_ns, extra);
+}
+extern "C" fn profile_mark(stage: u32, frame_id: u64, extra: u64) {
+    alvr_profiling::alvr_profile_mark(stage as u8, frame_id, extra);
 }
 
 extern "C" fn get_dynamic_encoder_params() -> FfiDynamicEncoderParams {
@@ -455,6 +487,9 @@ pub unsafe extern "C" fn HmdDriverFactory(
             Some(filesystem_layout.crash_log()),
         );
 
+        // Env-gated ring buffer / JSONL (ALVR_PROFILE=summary|frame|detail)
+        alvr_profiling::init_from_env();
+
         unsafe {
             g_sessionPath = CString::new(filesystem_layout.session().to_string_lossy().to_string())
                 .unwrap()
@@ -491,6 +526,12 @@ pub unsafe extern "C" fn HmdDriverFactory(
             ReportPresent = Some(report_present);
             WaitForVSync = Some(wait_for_vsync);
             ShutdownRuntime = Some(shutdown_driver);
+            ProfileEnabled = Some(profile_enabled);
+            ProfileNowNs = Some(profile_now_ns);
+            ProfileSpanBegin = Some(profile_span_begin);
+            ProfileSpanEnd = Some(profile_span_end);
+            ProfileRecord = Some(profile_record);
+            ProfileMark = Some(profile_mark);
 
             // When there is already a ALVR dashboard running, initialize the HMD device early to
             // avoid buggy SteamVR behavior

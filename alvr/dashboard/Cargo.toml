@@ -18,7 +18,8 @@ alvr_gui_common.workspace = true
 
 bincode = "1"
 chrono = "0.4"
-eframe = "0.31"
+# "persistence" enables eframe storage so window position/size are restored across runs.
+eframe = { version = "0.31", features = ["persistence"] }
 env_logger = "0.11"
 ico = "0.4"
 rand = "0.9"

@@ -11,11 +11,14 @@ crate-type = ["cdylib"]
 
 [features]
 gpl = [] # Enable for FFmpeg support on Windows. Always enabled on Linux
+# Forward Tracy/profiling from server_core when building the driver with profiling enabled
+trace-performance = ["alvr_server_core/trace-performance"]
 
 [dependencies]
 alvr_common.workspace = true
 alvr_filesystem.workspace = true
 alvr_packets.workspace = true
+alvr_profiling.workspace = true
 alvr_server_core.workspace = true
 alvr_server_io.workspace = true
 alvr_session.workspace = true

@@ -936,12 +936,34 @@ fn connection_pipeline(
                         Err(RecvTimeoutError::Disconnected) => return,
                     };
 
+                let frame_id = header.timestamp.as_nanos() as u64;
+                let payload_len = payload.len() as u64;
+                alvr_profiling::mark(
+                    alvr_profiling::Stage::ChannelDequeue,
+                    frame_id,
+                    payload_len,
+                );
+
                 let mut buffer = video_sender.get_buffer(&header).unwrap();
                 // todo: make encoder write to socket buffers directly to avoid copy
-                buffer
-                    .get_range_mut(0, payload.len())
-                    .copy_from_slice(&payload);
-                video_sender.send(buffer).ok();
+                {
+                    let _copy = alvr_profiling::Span::with_extra(
+                        alvr_profiling::Stage::StreamCopy,
+                        frame_id,
+                        payload_len,
+                    );
+                    buffer
+                        .get_range_mut(0, payload.len())
+                        .copy_from_slice(&payload);
+                }
+                {
+                    let _send = alvr_profiling::Span::with_extra(
+                        alvr_profiling::Stage::TcpSend,
+                        frame_id,
+                        payload_len,
+                    );
+                    video_sender.send(buffer).ok();
+                }
             }
         }
     });
@@ -1128,6 +1150,10 @@ fn connection_pipeline(
                 if let Some(stats) = &mut *ctx.statistics_manager.write() {
                     let timestamp = client_stats.target_timestamp;
                     let decoder_latency = client_stats.video_decode;
+                    let _stats_span = alvr_profiling::Span::new(
+                        alvr_profiling::Stage::ClientStatsMatch,
+                        timestamp.as_nanos() as u64,
+                    );
                     let (network_latency, game_latency) = stats.report_statistics(client_stats);
 
                     ctx.events_sender

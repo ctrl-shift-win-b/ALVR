@@ -189,6 +189,18 @@ pub fn build_ffmpeg_linux(enable_nvenc: bool, deps_path: &Path) {
     let ffmpeg_command = "for p in ../../../alvr/xtask/patches/*; do patch -p1 < $p; done";
     cmd!(sh, "bash -c {ffmpeg_command}").run().unwrap();
 
+    // NVENC API 13 renamed *_PL buffer formats; FFmpeg n6.0 still uses the old names.
+    if enable_nvenc {
+        let compat = r#"
+sed -i \
+  -e 's/NV_ENC_BUFFER_FORMAT_YV12_PL/NV_ENC_BUFFER_FORMAT_YV12/g' \
+  -e 's/NV_ENC_BUFFER_FORMAT_NV12_PL/NV_ENC_BUFFER_FORMAT_NV12/g' \
+  -e 's/NV_ENC_BUFFER_FORMAT_YUV444_PL/NV_ENC_BUFFER_FORMAT_YUV444/g' \
+  libavcodec/nvenc.c
+"#;
+        cmd!(sh, "bash -c {compat}").run().unwrap();
+    }
+
     if enable_nvenc {
         /*
            Describing Nvidia specific options --nvccflags:
@@ -201,6 +213,8 @@ pub fn build_ffmpeg_linux(enable_nvenc: bool, deps_path: &Path) {
         */
         #[cfg(target_os = "linux")]
         {
+            // Keep 12.1.x: FFmpeg n6.0 does not build against NVENC API 13 headers.
+            // Dynamic loader still works with modern drivers (incl. RTX 50-series).
             let codec_header_version = "12.1.14.0";
             let temp_download_dir = deps_path.join("dl_temp");
             command::download_and_extract_zip(
@@ -238,16 +252,22 @@ pub fn build_ffmpeg_linux(enable_nvenc: bool, deps_path: &Path) {
                 .reduce(|a, b| format!("{a} {b}"))
                 .expect("pkg-config cuda entry to have link-paths");
 
-            let nvenc_flags = &[
-                "--enable-encoder=h264_nvenc",
-                "--enable-encoder=hevc_nvenc",
-                "--enable-encoder=av1_nvenc",
-                "--enable-nonfree",
-                "--enable-cuda-nvcc",
-                "--enable-libnpp",
-                "--nvccflags=\"-gencode arch=compute_52,code=sm_52 -O2\"",
-                &format!("--extra-cflags=\"{include_flags}\""),
-                &format!("--extra-ldflags=\"{link_flags}\""),
+            // CUDA 12+/13 dropped sm_52 (FFmpeg's old default). FFmpeg's nvcc probe
+            // uses -ptx and rejects multiple -gencode; default Blackwell sm_120 (RTX 50xx).
+            // Override: ALVR_NVCC_ARCH='arch=compute_75,code=sm_75' for older GPUs.
+            let nvcc_arch = std::env::var("ALVR_NVCC_ARCH").unwrap_or_else(|_| {
+                "arch=compute_120,code=sm_120".into()
+            });
+            let nvenc_flags = [
+                "--enable-encoder=h264_nvenc".to_owned(),
+                "--enable-encoder=hevc_nvenc".to_owned(),
+                "--enable-encoder=av1_nvenc".to_owned(),
+                "--enable-nonfree".to_owned(),
+                "--enable-cuda-nvcc".to_owned(),
+                "--enable-libnpp".to_owned(),
+                format!("--nvccflags=\"-gencode {nvcc_arch} -O2\""),
+                format!("--extra-cflags=\"{include_flags}\""),
+                format!("--extra-ldflags=\"{link_flags}\""),
             ];
 
             let env_vars = format!(
@@ -257,8 +277,17 @@ pub fn build_ffmpeg_linux(enable_nvenc: bool, deps_path: &Path) {
             let flags_combined = flags.join(" ");
             let nvenc_flags_combined = nvenc_flags.join(" ");
 
+            // Ensure nvcc is on PATH for FFmpeg's configure probe (Steam/env may not).
+            let path = std::env::var("PATH").unwrap_or_default();
+            let cuda_bin = "/usr/local/cuda/bin";
+            let path_export = if path.split(':').any(|p| p == cuda_bin) {
+                format!("PATH='{path}'")
+            } else {
+                format!("PATH='{cuda_bin}:{path}'")
+            };
+
             let command = format!(
-                "{env_vars} ./configure {install_prefix} {flags_combined} {nvenc_flags_combined}"
+                "{path_export} {env_vars} ./configure {install_prefix} {flags_combined} {nvenc_flags_combined}"
             );
 
             cmd!(sh, "bash -c {command}").run().unwrap();

@@ -10,7 +10,8 @@ license = "MIT"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-trace-performance = ["profiling/profile-with-tracy"]
+# Tracy zones + env ring buffer (ALVR_PROFILE). Lab builds: cargo build -p alvr_server_openvr --features alvr_server_core/trace-performance
+trace-performance = ["alvr_profiling/tracy", "alvr_sockets/trace-performance"]
 
 [dependencies]
 alvr_adb.workspace = true
@@ -19,6 +20,7 @@ alvr_common.workspace = true
 alvr_events.workspace = true
 alvr_filesystem.workspace = true
 alvr_packets.workspace = true
+alvr_profiling.workspace = true
 alvr_server_io.workspace = true
 alvr_session.workspace = true
 alvr_sockets.workspace = true
@@ -39,7 +41,6 @@ hyper = { version = "0.14", features = [
     "tcp",
 ] }
 mdns-sd = "0.13"
-profiling = { version = "1", optional = true }
 reqwest = "0.11" # not used but webserver does not work without it. todo: investigate
 rosc = "0.10"
 tokio = { version = "1", features = [

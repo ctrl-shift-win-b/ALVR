@@ -19,6 +19,7 @@ alvr_filesystem = { path = "alvr/filesystem" }
 alvr_graphics = { path = "alvr/graphics" }
 alvr_gui_common = { path = "alvr/gui_common" }
 alvr_packets = { path = "alvr/packets" }
+alvr_profiling = { path = "alvr/profiling" }
 alvr_server_core = { path = "alvr/server_core"}
 alvr_server_io = { path = "alvr/server_io" }
 alvr_session = { path = "alvr/session" }

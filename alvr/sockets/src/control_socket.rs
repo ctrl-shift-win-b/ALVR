@@ -150,8 +150,11 @@ impl ProtoControlSocket {
     pub fn connect_to(timeout: Duration, peer: PeerType<'_>) -> ConResult<(Self, IpAddr)> {
         let socket = match peer {
             PeerType::AnyClient(ips) => {
+                // AVP opens the control listen only while advertising; short timeouts
+                // race with discovery and produce spurious failures.
+                let connect_timeout = timeout.max(Duration::from_secs(3));
                 tcp::connect_to_client(
-                    timeout,
+                    connect_timeout,
                     &ips,
                     CONTROL_PORT,
                     SocketBufferSize::Default,

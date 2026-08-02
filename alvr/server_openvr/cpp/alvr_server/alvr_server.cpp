@@ -220,6 +220,18 @@ unsigned long long (*GetSerialNumber)(unsigned long long deviceID, char* outStri
 void (*SetOpenvrProps)(void* instancePtr, unsigned long long deviceID);
 void (*RegisterButtons)(void* instancePtr, unsigned long long deviceID);
 void (*WaitForVSync)();
+unsigned char (*ProfileEnabled)();
+unsigned long long (*ProfileNowNs)();
+void (*ProfileSpanBegin)(unsigned int stage, unsigned long long frame_id);
+void (*ProfileSpanEnd)(unsigned int stage);
+void (*ProfileRecord)(
+    unsigned int stage,
+    unsigned long long frame_id,
+    unsigned long long start_ns,
+    unsigned long long end_ns,
+    unsigned long long extra
+);
+void (*ProfileMark)(unsigned int stage, unsigned long long frame_id, unsigned long long extra);
 
 void CppInit(bool earlyHmdInitialization) {
     g_driver_provider.early_hmd_initialization = earlyHmdInitialization;

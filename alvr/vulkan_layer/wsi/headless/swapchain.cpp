@@ -44,6 +44,7 @@
 #include <util/timed_semaphore.hpp>
 
 #include "util/logger.h"
+#include "util/alvr_profile_capture.h"
 #include "platform/linux/protocol.h"
 #include "swapchain.hpp"
 #include "wsi/display.hpp"
@@ -347,7 +348,10 @@ void swapchain::submit_image(uint32_t pending_index) {
         packet.frame = m_display.m_vsync_count;
         packet.semaphore_value = m_swapchain_images[pending_index].semaphore_value;
         memcpy(&packet.pose, pose, sizeof(packet.pose));
+        const uint64_t t0 = alvr_profile_capture::now_ns();
+        packet.submit_ns = t0;
         ret = write(m_socket, &packet, sizeof(packet));
+        const uint64_t t1 = alvr_profile_capture::now_ns();
         if (ret == -1) {
             // Encoder likely restarted; reconnect on next present.
             Error("swapchain::submit_image: write(present) failed: %s — will reconnect\n",
@@ -355,6 +359,10 @@ void swapchain::submit_image(uint32_t pending_index) {
             close(m_socket);
             m_socket = -1;
             m_connected = false;
+        } else {
+            alvr_profile_capture::write_span(
+                "present_submit", (uint64_t)packet.frame, t0, t1, (uint64_t)packet.image
+            );
         }
     }
 }
