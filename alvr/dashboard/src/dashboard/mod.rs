@@ -21,10 +21,12 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Tab {
+    /// Pre-SteamVR streaming bake (was Hard Config)
     HardConfig,
+    /// Full schema editor; streaming-critical fields locked (was Runtime Settings)
+    Settings,
     Devices,
     Statistics,
-    Settings,
     #[cfg(not(target_arch = "wasm32"))]
     Installation,
     Logs,
@@ -67,10 +69,10 @@ impl Dashboard {
             server_restarting_condvar: Arc::new(Condvar::new()),
             selected_tab: Tab::HardConfig,
             tab_labels: [
-                (Tab::HardConfig, "🔒  Hard Config"),
-                (Tab::Devices, "🔌  Devices"),
+                (Tab::HardConfig, "📡  SteamVR Streaming"),
+                (Tab::Settings, "⚙  Advanced Settings"),
+                (Tab::Devices, "🔌  Device Approval"),
                 (Tab::Statistics, "📈  Statistics"),
-                (Tab::Settings, "⚙  Runtime Settings"),
                 #[cfg(not(target_arch = "wasm32"))]
                 (Tab::Installation, "💾  Installation"),
                 (Tab::Logs, "📝  Logs"),
@@ -345,21 +347,28 @@ impl eframe::App for Dashboard {
                                 }
                             }
                             Tab::Settings => {
+                                let streaming_summary = self
+                                    .session
+                                    .as_ref()
+                                    .map(HardConfigTab::streaming_summary_line);
                                 if connected_to_server {
                                     ui.colored_label(
                                         theme::OK_GREEN,
-                                        "Runtime mode: prefer real-time settings. Hard layout \
-                                        changes require Hard Config + SteamVR relaunch.",
+                                        "Advanced mode: prefer real-time settings while streaming. \
+                                        Resolution / codec / bitrate live on SteamVR Streaming.",
                                     );
                                 } else {
                                     ui.colored_label(
                                         theme::log_colors::WARNING_LIGHT,
-                                        "SteamVR is not connected. Use Hard Config first, then \
-                                        Solidify & Launch.",
+                                        "SteamVR is not connected. Use SteamVR Streaming first, \
+                                        then Solidify & Launch.",
                                     );
                                 }
                                 ui.add_space(8.0);
-                                requests.extend(self.settings_tab.ui(ui));
+                                requests.extend(
+                                    self.settings_tab
+                                        .ui(ui, streaming_summary.as_deref()),
+                                );
                             }
                             #[cfg(not(target_arch = "wasm32"))]
                             Tab::Installation => {

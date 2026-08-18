@@ -109,7 +109,11 @@ impl SettingsTab {
         self.session_settings_json = Some(settings_json);
     }
 
-    pub fn ui(&mut self, ui: &mut Ui) -> Vec<ServerRequest> {
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        streaming_summary: Option<&str>,
+    ) -> Vec<ServerRequest> {
         let mut requests = vec![];
 
         let now = Instant::now();
@@ -120,6 +124,32 @@ impl SettingsTab {
 
             self.last_update_instant = now;
         }
+
+        // Managed on SteamVR Streaming — show values, do not edit here.
+        Frame::group(ui.style())
+            .fill(theme::DARKER_BG)
+            .inner_margin(egui::vec2(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("SteamVR Streaming controls (locked here)")
+                        .strong()
+                        .color(theme::FG),
+                );
+                if let Some(line) = streaming_summary {
+                    ui.colored_label(theme::OK_GREEN, line);
+                } else {
+                    ui.label("Loading session…");
+                }
+                ui.label(
+                    RichText::new(
+                        "Resolution, refresh rate, codec, and constant bitrate are set on the \
+                         SteamVR Streaming page (and require solidify / SteamVR restart). \
+                         Change them there — not below.",
+                    )
+                    .small(),
+                );
+            });
+        ui.add_space(8.0);
 
         let mut path_value_pairs = vec![];
         ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
@@ -153,10 +183,25 @@ impl SettingsTab {
                         .num_columns(2)
                         .min_col_width(MIN_COLUMN_SIZE)
                         .show(ui, |ui| {
-                            path_value_pairs.extend(self.resolution_preset.ui(ui));
+                            // Resolution / FPS / codec moved to SteamVR Streaming
+                            ui.add_enabled_ui(false, |ui| {
+                                let _ = self.resolution_preset.ui(ui);
+                            });
+                            ui.label(
+                                RichText::new("→ SteamVR Streaming")
+                                    .small()
+                                    .color(theme::log_colors::WARNING_LIGHT),
+                            );
                             ui.end_row();
 
-                            path_value_pairs.extend(self.framerate_preset.ui(ui));
+                            ui.add_enabled_ui(false, |ui| {
+                                let _ = self.framerate_preset.ui(ui);
+                            });
+                            ui.label(
+                                RichText::new("→ SteamVR Streaming")
+                                    .small()
+                                    .color(theme::log_colors::WARNING_LIGHT),
+                            );
                             ui.end_row();
 
                             path_value_pairs.extend(self.encoder_preset.ui(ui));
@@ -165,7 +210,14 @@ impl SettingsTab {
                             path_value_pairs.extend(self.foveation_preset.ui(ui));
                             ui.end_row();
 
-                            path_value_pairs.extend(self.codec_preset.ui(ui));
+                            ui.add_enabled_ui(false, |ui| {
+                                let _ = self.codec_preset.ui(ui);
+                            });
+                            ui.label(
+                                RichText::new("→ SteamVR Streaming")
+                                    .small()
+                                    .color(theme::log_colors::WARNING_LIGHT),
+                            );
                             ui.end_row();
 
                             path_value_pairs.extend(self.game_audio_preset.ui(ui));
