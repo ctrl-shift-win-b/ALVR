@@ -4,8 +4,8 @@
 //! the connect path never needs to restart, and NvEnc gets valid presets (not 0 / "p0").
 
 use crate::{
-    BodyTrackingBDConfig, BodyTrackingSinkConfig, ControllersEmulationMode, FrameSize, OpenvrConfig,
-    SessionConfig, SocketProtocolDefaultVariant,
+    BakedStereoGeometry, BodyTrackingBDConfig, BodyTrackingSinkConfig, ControllersEmulationMode,
+    FrameSize, HeadsetHardProfile, OpenvrConfig, SessionConfig, SocketProtocolDefaultVariant,
 };
 use alvr_common::settings_schema::Switch;
 
@@ -216,6 +216,11 @@ pub fn solidify_hard_config(session: &mut SessionConfig) {
         capture_frame_dir: settings.extra.capture.capture_frame_dir.clone(),
         amd_bitrate_corruption_fix: settings.video.bitrate.image_corruption_fix,
         use_separate_hand_trackers,
+        default_stereo: if session.baked_stereo.is_valid() {
+            session.baked_stereo
+        } else {
+            BakedStereoGeometry::for_profile(session.headset_hard_profile)
+        },
         _controller_profile: controller_profile,
         _server_impl_debug: settings.extra.logging.debug_groups.server_impl,
         _client_impl_debug: settings.extra.logging.debug_groups.client_impl,
@@ -237,6 +242,7 @@ pub fn solidify_hard_config(session: &mut SessionConfig) {
 }
 
 /// Defaults safe for App Store AVP client 20.14.1.
+/// Does not change per-eye resolution / codec / bitrate.
 pub fn apply_avp_profile(session: &mut SessionConfig) {
     let ss = &mut session.session_settings;
     ss.headset.controllers.enabled = true;
@@ -255,6 +261,32 @@ pub fn apply_avp_profile(session: &mut SessionConfig) {
         crate::EncoderQualityPresetNvidiaDefaultVariant::P1;
     ss.video.encoder_config.nvenc.tuning_preset.variant =
         crate::NvencTuningPresetDefaultVariant::UltraLowLatency;
+    session.headset_hard_profile = HeadsetHardProfile::Avp;
+    session.baked_stereo = BakedStereoGeometry::AVP;
+    session.hard_config_solidified = false;
+}
+
+/// Defaults for a Quest 3 ALVR client on this host.
+/// Keeps the current per-eye resolution (5000×5000 is fine).
+pub fn apply_quest3_profile(session: &mut SessionConfig) {
+    let ss = &mut session.session_settings;
+    ss.headset.controllers.enabled = true;
+    ss.headset.controllers.content.emulation_mode.variant =
+        crate::ControllersEmulationModeDefaultVariant::Quest3Plus;
+    ss.headset.controllers.content.hand_skeleton.enabled = false;
+    ss.headset
+        .controllers
+        .content
+        .hand_skeleton
+        .content
+        .steamvr_input_2_0 = false;
+    ss.connection.stream_protocol.variant = SocketProtocolDefaultVariant::Udp;
+    ss.video.encoder_config.nvenc.quality_preset.variant =
+        crate::EncoderQualityPresetNvidiaDefaultVariant::P1;
+    ss.video.encoder_config.nvenc.tuning_preset.variant =
+        crate::NvencTuningPresetDefaultVariant::UltraLowLatency;
+    session.headset_hard_profile = HeadsetHardProfile::Quest3;
+    session.baked_stereo = BakedStereoGeometry::QUEST3;
     session.hard_config_solidified = false;
 }
 
@@ -265,6 +297,10 @@ impl SessionConfig {
 
     pub fn apply_avp_profile(&mut self) {
         apply_avp_profile(self);
+    }
+
+    pub fn apply_quest3_profile(&mut self) {
+        apply_quest3_profile(self);
     }
 
     pub fn locked_openvr_layout(&self) -> &OpenvrConfig {

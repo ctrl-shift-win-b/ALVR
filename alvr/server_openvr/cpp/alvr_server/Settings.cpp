@@ -119,8 +119,39 @@ void Settings::Load() {
 
         m_useSeparateHandTrackers = config.get("use_separate_hand_trackers").get<bool>();
 
+        auto json_f32 = [](const picojson::value& parent, const char* key, float fallback) {
+            auto v = parent.get(key);
+            if (v.is<double>())
+                return (float)v.get<double>();
+            if (v.is<int64_t>())
+                return (float)v.get<int64_t>();
+            return fallback;
+        };
+        auto stereo = config.get("default_stereo");
+        m_defaultIpdM = json_f32(stereo, "ipd_m", 0.063f);
+        m_defaultFovLLeft = json_f32(stereo, "fov_l_left", -1.054f);
+        m_defaultFovLRight = json_f32(stereo, "fov_l_right", 0.791f);
+        m_defaultFovLUp = json_f32(stereo, "fov_l_up", 0.878f);
+        m_defaultFovLDown = json_f32(stereo, "fov_l_down", -0.791f);
+        m_defaultFovRLeft = json_f32(stereo, "fov_r_left", -0.793f);
+        m_defaultFovRRight = json_f32(stereo, "fov_r_right", 1.057f);
+        m_defaultFovRUp = json_f32(stereo, "fov_r_up", 0.881f);
+        m_defaultFovRDown = json_f32(stereo, "fov_r_down", -0.793f);
+
         Info("Render Target: %d %d\n", m_renderWidth, m_renderHeight);
         Info("Refresh Rate: %d\n", m_refreshRate);
+        Info(
+            "Baked stereo ipd=%.4f fovL=[%.3f,%.3f,%.3f,%.3f] fovR=[%.3f,%.3f,%.3f,%.3f]",
+            m_defaultIpdM,
+            m_defaultFovLLeft,
+            m_defaultFovLRight,
+            m_defaultFovLUp,
+            m_defaultFovLDown,
+            m_defaultFovRLeft,
+            m_defaultFovRRight,
+            m_defaultFovRUp,
+            m_defaultFovRDown
+        );
         m_loaded = true;
     } catch (std::exception& e) {
         Error("Exception on parsing session config (%s): %hs\n", g_sessionPath, e.what());

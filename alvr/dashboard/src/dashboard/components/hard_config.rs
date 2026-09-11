@@ -6,8 +6,9 @@
 use alvr_gui_common::theme;
 use alvr_packets::ServerRequest;
 use alvr_session::{
-    BitrateModeDefaultVariant, CodecTypeDefaultVariant, ControllersEmulationModeDefaultVariant,
-    FrameSizeDefaultVariant, SessionConfig, SocketProtocolDefaultVariant,
+    BakedStereoGeometry, BitrateModeDefaultVariant, CodecTypeDefaultVariant,
+    ControllersEmulationModeDefaultVariant, FrameSizeDefaultVariant, HeadsetHardProfile,
+    SessionConfig, SocketProtocolDefaultVariant,
 };
 use eframe::egui::{self, RichText, ScrollArea, Ui};
 
@@ -92,6 +93,8 @@ impl CodecChoice {
 }
 
 pub struct HardConfigTab {
+    headset_profile: HeadsetHardProfile,
+    baked_stereo: BakedStereoGeometry,
     preset: StreamingPreset,
     preferred_fps: f32,
     stream_width: u32,
@@ -158,6 +161,8 @@ impl ControllerProfileChoice {
 impl HardConfigTab {
     pub fn new() -> Self {
         Self {
+            headset_profile: HeadsetHardProfile::Avp,
+            baked_stereo: BakedStereoGeometry::AVP,
             preset: StreamingPreset::Medium,
             preferred_fps: 90.0,
             stream_width: 3400,
@@ -172,6 +177,25 @@ impl HardConfigTab {
             stream_tcp: true,
             status_message: None,
             applying_preset: false,
+        }
+    }
+
+    fn apply_headset_to_tab(&mut self, profile: HeadsetHardProfile) {
+        self.headset_profile = profile;
+        self.baked_stereo = BakedStereoGeometry::for_profile(profile);
+        match profile {
+            HeadsetHardProfile::Avp => {
+                self.controller_profile = ControllerProfileChoice::ValveIndex;
+                self.hand_skeleton = false;
+                self.hand_skeleton_steamvr_2 = false;
+                self.stream_tcp = true;
+            }
+            HeadsetHardProfile::Quest3 => {
+                self.controller_profile = ControllerProfileChoice::Quest3Plus;
+                self.hand_skeleton = false;
+                self.hand_skeleton_steamvr_2 = false;
+                self.stream_tcp = false;
+            }
         }
     }
 
@@ -235,6 +259,12 @@ impl HardConfigTab {
     }
 
     pub fn sync_from_session(&mut self, session: &SessionConfig) {
+        self.headset_profile = session.headset_hard_profile;
+        self.baked_stereo = if session.baked_stereo.is_valid() {
+            session.baked_stereo
+        } else {
+            BakedStereoGeometry::for_profile(session.headset_hard_profile)
+        };
         let ss = &session.session_settings;
         self.preferred_fps = ss.video.preferred_fps;
         self.use_absolute_resolution = matches!(
@@ -254,13 +284,9 @@ impl HardConfigTab {
         }
 
         self.codec = CodecChoice::from_variant(&ss.video.preferred_codec.variant);
+        // Keep the last-known constant-rate value even under Adaptive mode, so
+        // switching back to a preset has a sane starting point.
         self.bitrate_mbps = ss.video.bitrate.mode.ConstantMbps.max(1);
-        if !matches!(
-            ss.video.bitrate.mode.variant,
-            BitrateModeDefaultVariant::ConstantMbps
-        ) {
-            // Adaptive → show Custom; keep ConstantMbps value as last known target
-        }
 
         self.controllers_enabled = ss.headset.controllers.enabled;
         self.controller_profile = ControllerProfileChoice::from_variant(
@@ -290,6 +316,8 @@ impl HardConfigTab {
     }
 
     fn write_into_session(&self, session: &mut SessionConfig) {
+        session.headset_hard_profile = self.headset_profile;
+        session.baked_stereo = self.baked_stereo;
         let ss = &mut session.session_settings;
 
         ss.video.preferred_fps = self.preferred_fps;
@@ -346,8 +374,28 @@ impl HardConfigTab {
             BitrateModeDefaultVariant::Adaptive => "adaptive bitrate".into(),
         };
         format!(
-            "SteamVR Streaming: {:.0} Hz · {}×{} per eye · {} · {}",
-            ss.video.preferred_fps, w, h, codec, mode
+            "SteamVR Streaming: {} · {:.0} Hz · {}×{} per eye · {} · {}",
+            session.headset_hard_profile.label(),
+            ss.video.preferred_fps,
+            w,
+            h,
+            codec,
+            mode
+        )
+    }
+
+    fn stereo_summary(stereo: BakedStereoGeometry) -> String {
+        format!(
+            "IPD {:.1} mm · L [{:.3},{:.3},{:.3},{:.3}] · R [{:.3},{:.3},{:.3},{:.3}] rad",
+            stereo.ipd_m * 1000.0,
+            stereo.fov_l_left,
+            stereo.fov_l_right,
+            stereo.fov_l_up,
+            stereo.fov_l_down,
+            stereo.fov_r_left,
+            stereo.fov_r_right,
+            stereo.fov_r_up,
+            stereo.fov_r_down
         )
     }
 
@@ -362,8 +410,9 @@ impl HardConfigTab {
         ScrollArea::vertical().show(ui, |ui| {
             ui.label(
                 RichText::new(
-                    "Configure streaming on the PC, then solidify before SteamVR starts \
-                     (Virtual Desktop–style). Matched to App Store client 20.14.x.",
+                    "Pick the headset first, then solidify before SteamVR starts. SteamVR \
+                     snapshots FOV at launch — AVP and Quest 3 need different frustums. \
+                     Resolution (including 5000×5000) is shared.",
                 )
                 .color(theme::FG),
             );
@@ -373,7 +422,8 @@ impl HardConfigTab {
                 let init = &session.openvr_config;
                 let status = if session.hard_config_solidified {
                     format!(
-                        "Solidified: {}×{} per eye @ {} Hz",
+                        "Solidified: {} · {}×{} per eye @ {} Hz",
+                        session.headset_hard_profile.label(),
                         init.eye_resolution_width,
                         init.eye_resolution_height,
                         init.refresh_rate
@@ -396,6 +446,83 @@ impl HardConfigTab {
                     theme::log_colors::WARNING_LIGHT,
                     "SteamVR is running. Solidify & Launch will shut it down, bake config, and relaunch.",
                 );
+            }
+
+            // ----- Headset (FOV baked at SteamVR start) -----
+            ui.add_space(12.0);
+            ui.heading("Headset");
+            ui.label(
+                RichText::new(
+                    "SteamVR copies projection once at driver start. Select the headset \
+                     you will connect, then solidify.",
+                )
+                .small(),
+            );
+            ui.horizontal(|ui| {
+                for p in [HeadsetHardProfile::Avp, HeadsetHardProfile::Quest3] {
+                    let selected = self.headset_profile == p;
+                    if ui
+                        .selectable_label(selected, RichText::new(p.label()).strong())
+                        .clicked()
+                        && !selected
+                    {
+                        self.apply_headset_to_tab(p);
+                    }
+                }
+            });
+            ui.label(
+                RichText::new(Self::stereo_summary(self.baked_stereo))
+                    .small()
+                    .color(theme::FG),
+            );
+            match self.headset_profile {
+                HeadsetHardProfile::Avp => {
+                    ui.label(
+                        RichText::new("TCP · Valve Index controllers · AVP frustum")
+                            .small()
+                            .color(theme::FG),
+                    );
+                }
+                HeadsetHardProfile::Quest3 => {
+                    ui.label(
+                        RichText::new("UDP · Quest 3 Touch Plus · Quest 3 frustum")
+                            .small()
+                            .color(theme::FG),
+                    );
+                }
+            }
+
+            if let Some(session) = session {
+                if let Some(last) = &session.last_client_stereo {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Last connected client: {} — {}",
+                            last.display_name,
+                            Self::stereo_summary(last.stereo)
+                        ))
+                        .small(),
+                    );
+                    if ui
+                        .button("Use last client FOV for SteamVR start")
+                        .on_hover_text(
+                            "Copies the FOV/IPD the client actually sent. Solidify & relaunch \
+                             SteamVR afterwards. Does not change resolution.",
+                        )
+                        .clicked()
+                    {
+                        let stereo = last.stereo;
+                        let name = last.display_name.clone();
+                        self.baked_stereo = stereo;
+                        let mut s = session.clone();
+                        s.baked_stereo = stereo;
+                        s.hard_config_solidified = false;
+                        self.status_message = Some(format!(
+                            "Using last client FOV from {name} (not solidified)."
+                        ));
+                        actions.push(HardConfigAction::ApplySession(Box::new(s)));
+                    }
+                }
             }
 
             // ----- Presets -----
@@ -592,10 +719,8 @@ impl HardConfigTab {
                     if let Some(session) = session {
                         let mut s = session.clone();
                         s.apply_avp_profile();
-                        // Medium streaming defaults for AVP
-                        self.apply_preset(StreamingPreset::Medium);
                         self.sync_from_session(&s);
-                        // re-apply medium after sync may overwrite from session — write streaming into session
+                        // Medium streaming defaults for AVP
                         self.apply_preset(StreamingPreset::Medium);
                         self.write_into_session(&mut s);
                         self.sync_from_session(&s);
@@ -603,11 +728,30 @@ impl HardConfigTab {
                             Some("Applied AVP + Medium streaming defaults (not solidified).".into());
                         actions.push(HardConfigAction::ApplySession(Box::new(s)));
                     } else {
+                        self.apply_headset_to_tab(HeadsetHardProfile::Avp);
                         self.apply_preset(StreamingPreset::Medium);
-                        self.controller_profile = ControllerProfileChoice::ValveIndex;
-                        self.hand_skeleton = false;
-                        self.stream_tcp = true;
-                        self.status_message = Some("Local defaults set.".into());
+                        self.status_message = Some("Local AVP defaults set.".into());
+                    }
+                }
+
+                if ui
+                    .button(RichText::new("Apply Quest 3 defaults").strong())
+                    .clicked()
+                {
+                    if let Some(session) = session {
+                        let mut s = session.clone();
+                        s.apply_quest3_profile();
+                        self.sync_from_session(&s);
+                        self.write_into_session(&mut s);
+                        self.sync_from_session(&s);
+                        self.status_message = Some(
+                            "Applied Quest 3 frustum + Touch Plus + UDP (resolution unchanged, not solidified)."
+                                .into(),
+                        );
+                        actions.push(HardConfigAction::ApplySession(Box::new(s)));
+                    } else {
+                        self.apply_headset_to_tab(HeadsetHardProfile::Quest3);
+                        self.status_message = Some("Local Quest 3 defaults set.".into());
                     }
                 }
 
@@ -620,7 +764,8 @@ impl HardConfigTab {
                         self.write_into_session(&mut s);
                         s.solidify_hard_config();
                         self.status_message = Some(format!(
-                            "Solidified {}×{} @ {} Hz — launching SteamVR.",
+                            "Solidified {} · {}×{} @ {} Hz — launching SteamVR.",
+                            s.headset_hard_profile.label(),
                             s.openvr_config.eye_resolution_width,
                             s.openvr_config.eye_resolution_height,
                             s.openvr_config.refresh_rate

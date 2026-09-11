@@ -183,15 +183,52 @@ Hmd::Hmd()
     , m_streamComponentsInitialized(false) {
     Debug("Hmd::constructor");
 
-    // AVP-like defaults (from a valid App Store ViewsConfig on this branch).
-    // Symmetric ±1.0 rad placeholders made SteamVR render with the wrong frustum
-    // until a good client packet arrived (often 2+ s after stream start) — and
-    // the headset looks wrong from the first frame. Prefer realistic AVP FOV/IPD
-    // from activate so T0 and first stream frames are already close.
+    // Stereo geometry is chosen in Hard Config (AVP vs Quest 3) and baked into
+    // openvr_config before SteamVR starts. SteamVR snapshots GetProjectionRaw at
+    // activate, so this must already match the headset that will connect.
+    // Invalid/missing values fall back to the AVP frustum this branch was
+    // calibrated against (do not use symmetric ±1 rad placeholders).
     this->views_config = FfiViewsConfig {};
-    this->views_config.ipd_m = 0.063f;
-    this->views_config.fov[0] = FfiFov { -1.054f, 0.791f, 0.878f, -0.791f };
-    this->views_config.fov[1] = FfiFov { -0.793f, 1.057f, 0.881f, -0.793f };
+    auto& st = Settings::Instance();
+    this->views_config.ipd_m = st.m_defaultIpdM;
+    this->views_config.fov[0] = FfiFov {
+        st.m_defaultFovLLeft,
+        st.m_defaultFovLRight,
+        st.m_defaultFovLUp,
+        st.m_defaultFovLDown
+    };
+    this->views_config.fov[1] = FfiFov {
+        st.m_defaultFovRLeft,
+        st.m_defaultFovRRight,
+        st.m_defaultFovRUp,
+        st.m_defaultFovRDown
+    };
+    auto fov_ok = [](const FfiFov& f) {
+        return std::isfinite(f.left) && std::isfinite(f.right) && std::isfinite(f.up)
+            && std::isfinite(f.down) && std::fabs(f.left) < 2.5f && std::fabs(f.right) < 2.5f
+            && std::fabs(f.up) < 2.5f && std::fabs(f.down) < 2.5f && f.left < f.right
+            && f.down < f.up;
+    };
+    if (!(this->views_config.ipd_m > 0.04f && this->views_config.ipd_m < 0.10f)
+        || !fov_ok(this->views_config.fov[0]) || !fov_ok(this->views_config.fov[1])) {
+        Warn("Hmd::constructor: baked stereo invalid — falling back to AVP frustum");
+        this->views_config.ipd_m = 0.063f;
+        this->views_config.fov[0] = FfiFov { -1.054f, 0.791f, 0.878f, -0.791f };
+        this->views_config.fov[1] = FfiFov { -0.793f, 1.057f, 0.881f, -0.793f };
+    }
+    Warn(
+        "Hmd::constructor baked stereo ipd=%.4f fovL=[%.3f,%.3f,%.3f,%.3f] "
+        "fovR=[%.3f,%.3f,%.3f,%.3f]",
+        this->views_config.ipd_m,
+        this->views_config.fov[0].left,
+        this->views_config.fov[0].right,
+        this->views_config.fov[0].up,
+        this->views_config.fov[0].down,
+        this->views_config.fov[1].left,
+        this->views_config.fov[1].right,
+        this->views_config.fov[1].up,
+        this->views_config.fov[1].down
+    );
 
     m_poseHistory = std::make_shared<PoseHistory>();
 

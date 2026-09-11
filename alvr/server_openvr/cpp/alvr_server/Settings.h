@@ -92,4 +92,16 @@ public:
     int m_enableBodyTrackingFakeVive = false;
     int m_bodyTrackingHasLegs = false;
     bool m_useSeparateHandTrackers = false;
+
+    // Stereo frustum baked at Hard Config solidify (OpenXR radians).
+    // Fallback in Hmd() is AVP if these are unset/invalid.
+    float m_defaultIpdM = 0.063f;
+    float m_defaultFovLLeft = -1.054f;
+    float m_defaultFovLRight = 0.791f;
+    float m_defaultFovLUp = 0.878f;
+    float m_defaultFovLDown = -0.791f;
+    float m_defaultFovRLeft = -0.793f;
+    float m_defaultFovRRight = 1.057f;
+    float m_defaultFovRUp = 0.881f;
+    float m_defaultFovRDown = -0.793f;
 };

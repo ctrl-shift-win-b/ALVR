@@ -22,6 +22,129 @@ use std::{
 // the settings representation that the UI uses.
 pub type SessionSettings = settings::SettingsDefault;
 
+/// Headset chosen in Hard Config before SteamVR starts. SteamVR snapshots
+/// `GetProjectionRaw` at driver activate, so this must match the client that
+/// will connect.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadsetHardProfile {
+    #[default]
+    Avp,
+    Quest3,
+}
+
+impl HeadsetHardProfile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Avp => "Apple Vision Pro",
+            Self::Quest3 => "Quest 3",
+        }
+    }
+}
+
+/// Stereo frustum published to SteamVR at HMD activate (radians, OpenXR convention).
+/// Default is the App Store AVP ViewsConfig this branch was calibrated against.
+#[derive(Serialize, Deserialize, PartialEq, Clone, Copy, Debug)]
+#[serde(default)]
+pub struct BakedStereoGeometry {
+    pub ipd_m: f32,
+    pub fov_l_left: f32,
+    pub fov_l_right: f32,
+    pub fov_l_up: f32,
+    pub fov_l_down: f32,
+    pub fov_r_left: f32,
+    pub fov_r_right: f32,
+    pub fov_r_up: f32,
+    pub fov_r_down: f32,
+}
+
+impl BakedStereoGeometry {
+    /// App Store AVP client 20.14.1 (valid ViewsConfig on this host).
+    pub const AVP: Self = Self {
+        ipd_m: 0.063,
+        fov_l_left: -1.054,
+        fov_l_right: 0.791,
+        fov_l_up: 0.878,
+        fov_l_down: -0.791,
+        fov_r_left: -0.793,
+        fov_r_right: 1.057,
+        fov_r_up: 0.881,
+        fov_r_down: -0.793,
+    };
+
+    /// Quest 3 ALVR client ViewsConfig captured on this host (matches HMD geometry DB).
+    pub const QUEST3: Self = Self {
+        ipd_m: 0.0632,
+        fov_l_left: -0.942,
+        fov_l_right: 0.698,
+        fov_l_up: 0.768,
+        fov_l_down: -0.960,
+        fov_r_left: -0.698,
+        fov_r_right: 0.942,
+        fov_r_up: 0.768,
+        fov_r_down: -0.960,
+    };
+
+    pub fn for_profile(profile: HeadsetHardProfile) -> Self {
+        match profile {
+            HeadsetHardProfile::Avp => Self::AVP,
+            HeadsetHardProfile::Quest3 => Self::QUEST3,
+        }
+    }
+
+    pub fn from_client_fov(ipd_m: f32, fov: [alvr_common::Fov; 2]) -> Self {
+        Self {
+            ipd_m,
+            fov_l_left: fov[0].left,
+            fov_l_right: fov[0].right,
+            fov_l_up: fov[0].up,
+            fov_l_down: fov[0].down,
+            fov_r_left: fov[1].left,
+            fov_r_right: fov[1].right,
+            fov_r_up: fov[1].up,
+            fov_r_down: fov[1].down,
+        }
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.ipd_m > 0.04
+            && self.ipd_m < 0.10
+            && self.fov_l_left < self.fov_l_right
+            && self.fov_l_down < self.fov_l_up
+            && self.fov_r_left < self.fov_r_right
+            && self.fov_r_down < self.fov_r_up
+            && self.fov_l_left.is_finite()
+            && self.fov_l_right.is_finite()
+            && self.fov_l_up.is_finite()
+            && self.fov_l_down.is_finite()
+            && self.fov_r_left.is_finite()
+            && self.fov_r_right.is_finite()
+            && self.fov_r_up.is_finite()
+            && self.fov_r_down.is_finite()
+            && self.fov_l_left.abs() < 2.5
+            && self.fov_l_right.abs() < 2.5
+            && self.fov_l_up.abs() < 2.5
+            && self.fov_l_down.abs() < 2.5
+            && self.fov_r_left.abs() < 2.5
+            && self.fov_r_right.abs() < 2.5
+            && self.fov_r_up.abs() < 2.5
+            && self.fov_r_down.abs() < 2.5
+    }
+}
+
+impl Default for BakedStereoGeometry {
+    fn default() -> Self {
+        Self::AVP
+    }
+}
+
+/// Last valid ViewsConfig from a connected client, for refining baked stereo.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct LastClientStereo {
+    pub display_name: String,
+    pub stereo: BakedStereoGeometry,
+}
+
 // This structure is used to store the minimum configuration data that ALVR driver needs to
 // initialize OpenVR before having the chance to communicate with a client. When a client is
 // connected, a new OpenvrConfig instance is generated, then the connection is accepted only if that
@@ -103,6 +226,11 @@ pub struct OpenvrConfig {
     pub amd_bitrate_corruption_fix: bool,
     pub use_separate_hand_trackers: bool,
 
+    /// Stereo frustum for SteamVR at driver activate. Missing in old session.json
+    /// deserializes to AVP (this branch's previous hardcoded default).
+    #[serde(default)]
+    pub default_stereo: BakedStereoGeometry,
+
     // these settings are not used on the C++ side, but we need them to correctly trigger a SteamVR
     // restart
     pub _controller_profile: i32,
@@ -138,6 +266,15 @@ pub struct SessionConfig {
     /// request a SteamVR restart; use locked openvr_config geometry instead.
     #[serde(default)]
     pub hard_config_solidified: bool,
+    /// Headset selected in Hard Config. Controls baked stereo + controller/protocol defaults.
+    #[serde(default)]
+    pub headset_hard_profile: HeadsetHardProfile,
+    /// FOV/IPD that will be written into `openvr_config` on solidify.
+    #[serde(default)]
+    pub baked_stereo: BakedStereoGeometry,
+    /// Last valid client ViewsConfig (updated while streaming). Used to refine baked stereo.
+    #[serde(default)]
+    pub last_client_stereo: Option<LastClientStereo>,
 }
 
 impl Default for SessionConfig {
@@ -164,6 +301,9 @@ impl Default for SessionConfig {
             client_connections: HashMap::new(),
             session_settings: settings::session_settings_default(),
             hard_config_solidified: false,
+            headset_hard_profile: HeadsetHardProfile::Avp,
+            baked_stereo: BakedStereoGeometry::AVP,
+            last_client_stereo: None,
         };
         solidify::solidify_hard_config(&mut session);
         session

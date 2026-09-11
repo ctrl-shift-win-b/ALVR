@@ -24,8 +24,9 @@ use alvr_packets::{
     Tracking, VideoPacketHeader, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
 };
 use alvr_session::{
-    BodyTrackingBDConfig, BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize,
-    H264Profile, OpenvrConfig, SessionConfig, SocketProtocol,
+    BakedStereoGeometry, BodyTrackingBDConfig, BodyTrackingSinkConfig, CodecType,
+    ControllersEmulationMode, FrameSize, H264Profile, LastClientStereo, OpenvrConfig,
+    SessionConfig, SocketProtocol,
 };
 use alvr_sockets::{
     PeerType, ProtoControlSocket, StreamSocketBuilder, CONTROL_PORT, KEEPALIVE_INTERVAL,
@@ -1346,6 +1347,25 @@ fn connection_pipeline(
                                 config.fov[1].up,
                                 config.fov[1].down,
                             );
+                            {
+                                let stereo = BakedStereoGeometry::from_client_fov(
+                                    config.ipd_m,
+                                    config.fov,
+                                );
+                                let mut sm = SESSION_MANAGER.write();
+                                let display_name = sm
+                                    .client_list()
+                                    .get(&client_hostname)
+                                    .map(|c| c.display_name.clone())
+                                    .unwrap_or_else(|| client_hostname.clone());
+                                let snapshot = LastClientStereo {
+                                    display_name,
+                                    stereo,
+                                };
+                                if sm.session().last_client_stereo.as_ref() != Some(&snapshot) {
+                                    sm.session_mut().last_client_stereo = Some(snapshot);
+                                }
+                            }
                             ctx.events_sender
                                 .send(ServerCoreEvent::ViewsConfig(ViewsConfig {
                                     local_view_transforms: [
